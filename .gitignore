@@ -1,0 +1,19 @@
+# secrets
+.env
+
+# python
+__pycache__/
+*.pyc
+
+# logs
+logs/
+
+# test/sample documents uploaded during development (not source code)
+*.pdf
+*.hwp
+*.hwpx
+기업지원사업 사업아이템.txt
+
+# misc
+py
+.claude/

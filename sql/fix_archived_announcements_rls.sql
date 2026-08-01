@@ -1,0 +1,1 @@
+ALTER TABLE archived_announcements DISABLE ROW LEVEL SECURITY;
