@@ -109,7 +109,7 @@ if st.session_state.get("db_viewer_filter_key") != filter_key:
     st.session_state.db_viewer_page = 0
 
 if table == "announcements":
-    select_cols = "id,title,category,department,apply_start_date,end_date,max_grant,detail_url,content,attachment_filename,parsed_data"
+    select_cols = "id,title,category,department,apply_start_date,end_date,max_grant,detail_url,content,attachment_filename,parsed_data,is_active"
 else:
     select_cols = "id,title,category,department,region,apply_start_date,apply_end_date,detail_url,content"
 
@@ -138,6 +138,8 @@ for r in rows:
         is_pdf = table == "announcements" and (r.get("attachment_filename") or "").lower().endswith(".pdf")
         if is_pdf:
             badges += " :green-badge[PDF 심층분석]"
+        if table == "announcements" and r.get("is_active") is False:
+            badges += " :red-badge[마감됨]"
         st.markdown(badges)
 
         st.markdown(f"**{r.get('title') or '(제목 없음)'}**")

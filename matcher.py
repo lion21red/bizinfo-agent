@@ -179,8 +179,10 @@ def match_announcement(company: dict, parsed: dict) -> dict:
 
 
 def fetch_matchable_announcements():
-    """매칭 대상 공고를 조회한다. 마감일이 지난 공고는 매칭에서 제외하되,
-    DB에서 삭제하지는 않는다 (보관용 조회는 별도로 전체를 조회하면 됨).
+    """매칭 대상 공고를 조회한다. 마감일이 지난 공고나(end_date 기준), 기업마당 API
+    목록에서 이미 사라진 공고(is_active=False, collector.py가 매일 감지)는 매칭에서
+    제외하되, DB에서 바로 삭제하지는 않는다 (마감 후 1개월 유예기간을 두고 그 뒤에야
+    archived_announcements로 옮겨진다 - collector.py의 archive_old_closed_announcements 참고).
 
     PostgREST는 기본적으로 응답을 1000건으로 제한하므로, 공고 수가 그 이상으로
     늘어나도 전부 가져오도록 range()로 페이지를 나눠 조회한다."""
@@ -194,6 +196,7 @@ def fetch_matchable_announcements():
             supabase.table("announcements")
             .select("*")
             .not_.is_("parsed_data", "null")
+            .eq("is_active", True)
             .or_(f"end_date.is.null,end_date.gte.{today_str}")
             .range(start, start + page_size - 1)
             .execute()

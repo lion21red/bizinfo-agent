@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import html as html_lib
+from datetime import datetime, timedelta, timezone
 import requests
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -130,7 +131,9 @@ def save_to_supabase(items, chunk_size: int = 200):
             # 첨부파일 중 분석하기 가장 좋은 것 (PDF 우선, 없으면 대표 공고문 그대로)
             "attachment_url": attachment_url or None,
             "attachment_filename": attachment_filename or None,
-            "is_active": True
+            "is_active": True,
+            # API 목록에 다시 나타난 것이므로(재오픈 등) 이전에 마감 감지된 기록이 있었다면 초기화한다.
+            "closed_detected_at": None,
         })
 
     # origin_id 기준 중복 시 UPDATE, 없으면 INSERT (UPSERT) - 여러 건을 묶어서 요청 수를 줄인다
@@ -154,8 +157,116 @@ def save_to_supabase(items, chunk_size: int = 200):
 
     print("🎉 Supabase 데이터 적재 완료!")
 
-# 5. 실행
+
+# 5. 마감 감지: API 목록에서 사라진 활성 공고를 is_active=False로 표시
+def mark_expired_announcements(current_origin_ids: set[str]):
+    """이번에 API에서 가져온 목록(current_origin_ids)에 더 이상 없는 기존 활성 공고를 찾아
+    마감된 것으로 표시한다. 실제로 지우거나 옮기지는 않고, 감지 시각만 기록해서
+    archive_old_closed_announcements()가 1개월 뒤 아카이브로 옮길 때 기준으로 쓴다.
+    이미 is_active=False인 건은 다시 건드리지 않으므로(재확인해도 조건에 안 걸림),
+    마감 감지 시각이 매일 갱신되며 유예기간이 계속 늘어지는 일은 없다."""
+    page_size, start = 1000, 0
+    db_active_ids = set()
+    while True:
+        page = (
+            supabase.table("announcements")
+            .select("origin_id")
+            .eq("is_active", True)
+            .range(start, start + page_size - 1)
+            .execute()
+            .data
+        )
+        db_active_ids.update(r["origin_id"] for r in page)
+        if len(page) < page_size:
+            break
+        start += page_size
+
+    newly_closed_ids = list(db_active_ids - current_origin_ids)
+    if not newly_closed_ids:
+        print("ℹ️ 새로 마감 감지된 공고가 없습니다.")
+        return
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    chunk_size = 200
+    for i in range(0, len(newly_closed_ids), chunk_size):
+        chunk = newly_closed_ids[i:i + chunk_size]
+        supabase.table("announcements").update(
+            {"is_active": False, "closed_detected_at": now_iso}
+        ).in_("origin_id", chunk).execute()
+
+    print(f"🔔 마감 감지: {len(newly_closed_ids)}건을 '마감됨'으로 표시했습니다.")
+
+
+# 6. 마감된 지 1개월 지난 공고를 아카이브로 이동
+def archive_old_closed_announcements(grace_days: int = 30):
+    """마감 감지(closed_detected_at) 후 grace_days일이 지난 공고를 archived_announcements로
+    옮기고 announcements에서는 삭제한다. AI 파싱 결과(parsed_data)는 archived_announcements에
+    저장 공간이 없어 옮기지 않는다 - 아카이브는 원래 보관/검색 전용이라 정밀 매칭 데이터가
+    필요 없다는 기존 설계를 그대로 따른다."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=grace_days)).isoformat()
+
+    page_size, start = 1000, 0
+    to_archive = []
+    while True:
+        page = (
+            supabase.table("announcements")
+            .select("*")
+            .eq("is_active", False)
+            .lte("closed_detected_at", cutoff)
+            .range(start, start + page_size - 1)
+            .execute()
+            .data
+        )
+        to_archive.extend(page)
+        if len(page) < page_size:
+            break
+        start += page_size
+
+    if not to_archive:
+        print("ℹ️ 아카이브로 옮길 대상이 없습니다 (마감 후 유예기간이 지난 공고 없음).")
+        return
+
+    archive_rows = []
+    for r in to_archive:
+        attachments = None
+        if r.get("attachment_url"):
+            attachments = [{"filename": r.get("attachment_filename"), "url": r["attachment_url"]}]
+        archive_rows.append({
+            "origin_id": r["origin_id"],
+            "title": r.get("title"),
+            "category": r.get("category"),
+            "department": r.get("department"),
+            "apply_start_date": r.get("apply_start_date"),
+            "apply_end_date": r.get("end_date") or r.get("apply_end_date"),
+            "detail_url": r.get("detail_url"),
+            "content": r.get("content"),
+            "attachments": attachments,
+        })
+
+    chunk_size = 200
+    for i in range(0, len(archive_rows), chunk_size):
+        chunk = archive_rows[i:i + chunk_size]
+        # 이미 archive_collector.py가 같은 origin_id를 먼저 수집해뒀을 수도 있어 upsert로 처리한다.
+        supabase.table("archived_announcements").upsert(chunk, on_conflict="origin_id").execute()
+
+    origin_ids = [r["origin_id"] for r in to_archive]
+    for i in range(0, len(origin_ids), chunk_size):
+        chunk = origin_ids[i:i + chunk_size]
+        supabase.table("announcements").delete().in_("origin_id", chunk).execute()
+
+    print(f"🗄️ 마감 후 {grace_days}일이 지난 {len(to_archive)}건을 아카이브로 이동했습니다.")
+
+
+# 7. 실행
 if __name__ == "__main__":
     raw_announcements = fetch_bizinfo_announcements()
     if raw_announcements:
         save_to_supabase(raw_announcements)
+
+        current_ids = {
+            str(item.get("pblancId") or item.get("pblancIdStr"))
+            for item in raw_announcements
+            if item.get("pblancId") or item.get("pblancIdStr")
+        }
+        mark_expired_announcements(current_ids)
+        archive_old_closed_announcements()
