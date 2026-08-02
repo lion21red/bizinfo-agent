@@ -20,7 +20,8 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 # ---- 매칭할 기업 프로필 (테스트하고 싶은 기업 정보로 바꿔서 사용하세요) ----
 COMPANY_PROFILE = {
     "company_name": "테스트기업",
-    "establishment_date": "2023-05-01",  # YYYY-MM-DD (예비창업자면 None)
+    "establishment_date": "2023-05-01",  # YYYY-MM-DD (정보 없으면 None)
+    "is_pre_founder": False,             # 예비창업자 여부 (반드시 명시적으로 확인된 경우에만 True)
     "region": "서울",                     # 공고의 location_limit과 비교되는 지역명 (예: 서울, 경기, 부산, 경남 등)
     "industry": "소프트웨어 개발업",       # 공고의 industry_limit과 비교 (가점 참고용, 강한 필터링은 하지 않음)
     "annual_revenue": 300_000_000,        # 연매출액 (원)
@@ -38,10 +39,12 @@ COMPANY_PROFILE = {
 }
 
 
-def calc_company_age_years(establishment_date_str) -> float:
-    """설립일이 없으면 예비창업자로 간주해 업력 0으로 처리한다 (매칭 자체를 막지 않음)."""
+def calc_company_age_years(establishment_date_str):
+    """설립일 문자열로 업력(년)을 계산한다. 설립일 정보가 없으면 '알 수 없음'(None)을
+    반환할 뿐, 예비창업자로 단정하지 않는다 - 예비창업자 여부는 company['is_pre_founder']
+    플래그로 명시적으로 확인된 경우에만 별도로 반영한다."""
     if not establishment_date_str:
-        return 0.0
+        return None
     est = datetime.strptime(establishment_date_str, "%Y-%m-%d").date()
     return (date.today() - est).days / 365.25
 
@@ -68,10 +71,13 @@ def _as_number(value):
 
 def match_announcement(company: dict, parsed: dict) -> dict:
     """기업 프로필과 파싱된 공고 조건을 비교해 적합도를 산출"""
-    age = calc_company_age_years(company["establishment_date"])
+    # 예비창업자 여부가 명시적으로 확인된 경우에만 업력 0으로 취급한다.
+    # 설립일을 모른다고 해서 예비창업자로 단정하지 않고, 업력을 알 수 없는
+    # 상태(None)로 두어 업력 관련 필터를 건너뛴다 (다른 결측 항목과 동일하게 처리).
+    age = 0.0 if company.get("is_pre_founder") else calc_company_age_years(company.get("establishment_date"))
 
     min_years = parsed.get("min_years")
-    if min_years not in (None, "", "null"):
+    if age is not None and min_years not in (None, "", "null"):
         try:
             if age < float(min_years):
                 return {"is_eligible": False, "score": 0, "reason": f"업력 부족 (최소 {min_years}년 필요, 현재 {age:.1f}년)"}
@@ -79,7 +85,7 @@ def match_announcement(company: dict, parsed: dict) -> dict:
             pass
 
     max_years = parsed.get("max_years")
-    if max_years not in (None, "", "null"):
+    if age is not None and max_years not in (None, "", "null"):
         try:
             if age > float(max_years):
                 return {"is_eligible": False, "score": 0, "reason": f"업력 초과 (최대 {max_years}년, 현재 {age:.1f}년)"}

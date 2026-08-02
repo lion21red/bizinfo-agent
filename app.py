@@ -22,7 +22,7 @@ PROFILE_PROMPT_TEMPLATE = """
 [추출할 JSON 스키마]
 {{
   "company_name": "기업명",
-  "establishment_date": "설립일 (YYYY-MM-DD 형식, 확인 불가시 null. 예비창업자 등 아직 사업자등록 전이면 null)",
+  "establishment_date": "설립일 (YYYY-MM-DD 형식, 문서에 명시되어 있지 않으면 null)",
   "region": "소재 지역 (가능하면 시/군/구까지 상세히, 예: 서울 강남구, 경기 성남시 등)",
   "industry": "업종",
   "annual_revenue": "연매출액 (원 단위 숫자, 확인 불가시 0)",
@@ -36,7 +36,8 @@ PROFILE_PROMPT_TEMPLATE = """
   "business_entity_type": "기업 형태 ('법인' 또는 '개인사업자', 확인 불가시 null)",
   "is_disabled_owned": "장애인기업 여부 (true/false)",
   "is_reentrepreneur": "재창업/재도전 기업 여부 (폐업 후 다시 창업한 경우, true/false)",
-  "certifications": "보유 인증 목록 (이노비즈, 메인비즈, ISO 등을 쉼표로 구분한 문자열, 없으면 빈 문자열)"
+  "certifications": "보유 인증 목록 (이노비즈, 메인비즈, ISO 등을 쉼표로 구분한 문자열, 없으면 빈 문자열)",
+  "is_pre_founder": "예비창업자 여부. 문서 자체가 '예비창업패키지 신청서'이거나 '사업자등록 예정' 등 아직 사업자등록 전임을 명확히 밝히는 경우에만 true. 단순히 설립일을 문서에서 확인하지 못한 경우는 false로 두세요 (설립일 미확인과 예비창업자는 다른 의미입니다)"
 }}
 """
 
@@ -112,6 +113,7 @@ def save_company(profile: dict):
         "is_disabled_owned": profile.get("is_disabled_owned", False),
         "is_reentrepreneur": profile.get("is_reentrepreneur", False),
         "certifications": profile.get("certifications") or "",
+        "is_pre_founder": profile.get("is_pre_founder", False),
     }
     # company_name 기준 upsert: 같은 회사를 다시 저장하면 새 행을 만들지 않고 기존 값을 덮어쓴다.
     # (companies.company_name에 UNIQUE 제약이 있어야 동작함 - sql/dedupe_companies.sql 참고)
@@ -170,6 +172,7 @@ with st.expander("💾 저장된 기업 불러오기"):
                 "is_disabled_owned": c.get("is_disabled_owned"),
                 "is_reentrepreneur": c.get("is_reentrepreneur"),
                 "certifications": c.get("certifications"),
+                "is_pre_founder": c.get("is_pre_founder"),
             }
     else:
         st.caption("아직 저장된 기업이 없습니다.")
@@ -210,8 +213,10 @@ if st.session_state.profile:
 
     p = st.session_state.profile
     is_pre_founder = st.checkbox(
-        "예비창업자 (아직 사업자등록 전)", value=not bool(p.get("establishment_date"))
+        "예비창업자 (아직 사업자등록 전)", value=bool(p.get("is_pre_founder"))
     )
+    if not is_pre_founder and not p.get("establishment_date"):
+        st.caption("ℹ️ 설립일 정보를 확인하지 못했습니다. 예비창업자가 맞다면 위 체크박스를 선택해 주세요. 아니라면 업력 관련 조건은 매칭 시 확인하지 않고 진행합니다.")
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -263,6 +268,7 @@ if st.session_state.profile:
         "is_disabled_owned": is_disabled_owned,
         "is_reentrepreneur": is_reentrepreneur,
         "certifications": certifications,
+        "is_pre_founder": is_pre_founder,
     }
 
     btn_col1, btn_col2 = st.columns(2)
@@ -272,48 +278,42 @@ if st.session_state.profile:
         match_clicked = st.button("✅ 이 정보로 지원사업 매칭하기", type="primary")
 
     if save_clicked:
-        if not is_pre_founder and not establishment_date:
-            st.warning("설립일을 입력하거나, 예비창업자라면 위 체크박스를 선택해 주세요.")
-        else:
-            try:
-                save_company(confirmed_profile)
-                st.success(f"'{company_name}' 정보가 저장되었습니다.")
-            except Exception as e:
-                st.error(f"저장 중 오류가 발생했습니다: {e}")
+        try:
+            save_company(confirmed_profile)
+            st.success(f"'{company_name}' 정보가 저장되었습니다.")
+        except Exception as e:
+            st.error(f"저장 중 오류가 발생했습니다: {e}")
 
     if match_clicked:
-        if not is_pre_founder and not establishment_date:
-            st.warning("설립일을 입력하거나, 예비창업자라면 위 체크박스를 선택해 주세요.")
-        else:
-            with st.spinner("지원사업 DB와 매칭하는 중..."):
-                records = matcher.fetch_matchable_announcements()
-                results = []
-                for item in records:
-                    parsed = item.get("parsed_data") or {}
-                    r = matcher.match_announcement(confirmed_profile, parsed)
-                    results.append(
-                        {
-                            "title": item.get("title", ""),
-                            "department": item.get("department"),
-                            "category": item.get("category"),
-                            "apply_start_date": item.get("apply_start_date"),
-                            "end_date": item.get("end_date"),
-                            "max_grant": item.get("max_grant") or 0,
-                            "detail_url": item.get("detail_url"),
-                            "attachment_url": item.get("attachment_url"),
-                            "attachment_filename": item.get("attachment_filename"),
-                            "content": item.get("content"),
-                            "parsed_data": parsed,
-                            **r,
-                        }
-                    )
-                eligible = sorted(
-                    [r for r in results if r["is_eligible"]], key=lambda r: r["score"], reverse=True
+        with st.spinner("지원사업 DB와 매칭하는 중..."):
+            records = matcher.fetch_matchable_announcements()
+            results = []
+            for item in records:
+                parsed = item.get("parsed_data") or {}
+                r = matcher.match_announcement(confirmed_profile, parsed)
+                results.append(
+                    {
+                        "title": item.get("title", ""),
+                        "department": item.get("department"),
+                        "category": item.get("category"),
+                        "apply_start_date": item.get("apply_start_date"),
+                        "end_date": item.get("end_date"),
+                        "max_grant": item.get("max_grant") or 0,
+                        "detail_url": item.get("detail_url"),
+                        "attachment_url": item.get("attachment_url"),
+                        "attachment_filename": item.get("attachment_filename"),
+                        "content": item.get("content"),
+                        "parsed_data": parsed,
+                        **r,
+                    }
                 )
+            eligible = sorted(
+                [r for r in results if r["is_eligible"]], key=lambda r: r["score"], reverse=True
+            )
 
-            st.session_state.match_eligible = eligible
-            st.session_state.match_total = len(results)
-            st.session_state.match_page = 0
+        st.session_state.match_eligible = eligible
+        st.session_state.match_total = len(results)
+        st.session_state.match_page = 0
 
     if st.session_state.match_eligible is not None:
         eligible_all = st.session_state.match_eligible
