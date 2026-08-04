@@ -82,6 +82,28 @@ def pick_best_attachment(item: dict) -> tuple[str, str]:
     return filename, url
 
 
+def collect_all_attachments(item: dict) -> list[dict]:
+    """공고에 첨부된 파일 전체 목록(대표 공고문 + 기타 첨부파일)을 URL 기준으로 중복 제거해 모은다.
+    pick_best_attachment()는 매칭용 정밀분석(PDF 1건)에 쓰고, 이건 신청서 작성 도우미가
+    첨부파일을 빠짐없이 내려받아 반영할 때 쓴다."""
+    attachments = []
+    seen_urls = set()
+
+    def add(name, url):
+        name, url = (name or "").strip(), (url or "").strip()
+        if url and url not in seen_urls:
+            attachments.append({"filename": name, "url": url})
+            seen_urls.add(url)
+
+    add(item.get("printFileNm"), item.get("printFlpthNm"))
+    other_names = (item.get("fileNm") or "").split("@")
+    other_urls = (item.get("flpthNm") or "").split("@")
+    for name, url in zip(other_names, other_urls):
+        add(name, url)
+
+    return attachments
+
+
 DATE_PATTERN = re.compile(r"^\d{4}-\d{1,2}-\d{1,2}$")
 
 
@@ -131,6 +153,7 @@ def save_to_supabase(items, chunk_size: int = 200):
             # 첨부파일 중 분석하기 가장 좋은 것 (PDF 우선, 없으면 대표 공고문 그대로)
             "attachment_url": attachment_url or None,
             "attachment_filename": attachment_filename or None,
+            "attachments": collect_all_attachments(item) or None,
             "is_active": True,
             # API 목록에 다시 나타난 것이므로(재오픈 등) 이전에 마감 감지된 기록이 있었다면 초기화한다.
             "closed_detected_at": None,

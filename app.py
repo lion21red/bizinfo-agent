@@ -426,6 +426,7 @@ if st.session_state.profile:
                         "detail_url": item.get("detail_url"),
                         "attachment_url": item.get("attachment_url"),
                         "attachment_filename": item.get("attachment_filename"),
+                        "attachments": item.get("attachments"),
                         "content": item.get("content"),
                         "parsed_data": parsed,
                         **r,
@@ -458,6 +459,18 @@ if st.session_state.profile:
             selected_categories = []
 
         eligible = [r for r in eligible_all if (r.get("category") or "미분류") in selected_categories]
+
+        result_keyword = st.text_input("결과 내 검색 (공고명·기관으로)", key="match_result_search")
+        if result_keyword:
+            eligible = [
+                r for r in eligible
+                if result_keyword in (r.get("title") or "") or result_keyword in (r.get("department") or "")
+            ]
+
+        result_filter_key = (tuple(sorted(selected_categories)), result_keyword)
+        if st.session_state.get("match_result_filter_key") != result_filter_key:
+            st.session_state.match_result_filter_key = result_filter_key
+            st.session_state.match_page = 0
 
         st.write(f"✅ 적합 공고 **{len(eligible)}건** (전체 {st.session_state.match_total}건 중, 필터 반영)")
 
@@ -556,6 +569,7 @@ if st.session_state.profile:
                             "content": r.get("content"),
                             "attachment_url": r.get("attachment_url"),
                             "attachment_filename": r.get("attachment_filename"),
+                            "attachments": r.get("attachments"),
                         }
                         st.session_state.selected_company_profile = confirmed_profile
                         st.switch_page("pages/3_신청서작성.py")
