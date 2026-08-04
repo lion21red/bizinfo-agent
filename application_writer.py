@@ -124,20 +124,26 @@ REFINE_CHAT_PROMPT_TEMPLATE = """
 """
 
 TEMPLATE_MAP_PROMPT = """
-아래는 워드(.docx) 신청서 양식의 문단 목록(번호: 내용)입니다. 그리고 신청서 초안의 작성 항목 목록이
-있습니다. 각 작성 항목의 내용이 양식의 어떤 문단(제목/라벨/질문) 바로 다음에 들어가야 자연스러운지
-찾아서 매핑하세요. 해당하는 문단을 찾을 수 없으면 -1로 표시하세요. 서로 다른 항목을 같은 문단에
-매핑하지 마세요.
+아래는 워드(.docx) 신청서 양식에서 내용을 채워 넣을 수 있는 '위치 후보' 목록입니다. 각 후보는
+번호(index)와 종류(kind), 그리고 무엇을 채워야 할 자리인지 알려주는 라벨(label)로 구성됩니다.
+- kind가 "paragraph"인 경우: 그 문단(제목/라벨/안내문) 바로 다음에 내용이 들어갑니다.
+- kind가 "table_cell"인 경우: 한국 정부 신청서에 매우 흔한 [라벨 칸 | 값 칸] 표 구조에서, label에
+  적힌 라벨 칸 바로 옆(값 칸)에 내용이 들어갑니다. 표 구조인 양식은 이 표 셀 후보를 우선 활용하세요.
 
-[양식 문단 목록]
-{paragraphs_json}
+그리고 신청서 초안의 작성 항목 목록이 있습니다. 각 작성 항목의 내용이 들어가기에 가장 자연스러운
+위치 후보를 찾아 매핑하세요. 라벨의 표현이 완전히 같지 않아도 의미상 대응되면 매핑하세요
+(예: 항목명 "지원 동기" ↔ 라벨 "1. 신청 배경 및 수출 필요성"). 해당하는 후보를 찾을 수 없으면
+-1로 표시하세요. 서로 다른 항목을 같은 후보에 매핑하지 마세요.
+
+[위치 후보 목록]
+{targets_json}
 
 [작성 항목 목록]
 {section_names_json}
 
 [출력 형식]
 반드시 아래 JSON 형식으로만 답하세요. 키는 위 "작성 항목 목록"의 이름과 정확히 일치시키세요.
-{{"<항목명>": <문단번호 또는 -1>, "...": ...}}
+{{"<항목명>": <후보 번호 또는 -1>, "...": ...}}
 """
 
 
@@ -536,31 +542,77 @@ def _insert_paragraph_after(paragraph: Paragraph) -> Paragraph:
     return Paragraph(new_p, paragraph._parent)
 
 
+def _collect_fill_targets(doc: Document) -> list[dict]:
+    """양식에서 내용을 채워 넣을 수 있는 후보 위치를 문단과 '표 셀' 양쪽에서 모두 모은다.
+
+    한국 정부 신청서/사업계획서 양식은 자유서술형 문단보다 [라벨 칸 | 값 칸] 표 구조가
+    훨씬 흔한데(예: '지원 사업명' 칸 옆에 값을 적는 칸), 표 셀을 후보에서 빼면 그런 양식은
+    채울 수 있는 자리를 아예 못 찾아 매칭 정확도가 크게 떨어진다. 표의 각 행이 2칸 이상이면
+    앞 칸을 라벨로 보고 바로 다음 칸을 그 라벨에 대응하는 '값 칸' 후보로 등록한다."""
+    targets = []
+
+    for p in doc.paragraphs:
+        text = p.text.strip()
+        if text:
+            targets.append({"index": len(targets), "kind": "paragraph", "ref": p, "label": text[:150]})
+
+    for table in doc.tables:
+        for row in table.rows:
+            cells = row.cells
+            for c_idx, cell in enumerate(cells):
+                label_text = cell.text.strip()
+                if not label_text or c_idx + 1 >= len(cells):
+                    continue
+                value_cell = cells[c_idx + 1]
+                if value_cell._tc is cell._tc:
+                    continue  # 가로 병합된 칸 - 같은 칸을 라벨로 또 잡지 않는다
+                targets.append({
+                    "index": len(targets),
+                    "kind": "table_cell",
+                    "ref": value_cell,
+                    "label": f"[표] {label_text[:150]}",
+                })
+
+    return targets
+
+
+def _append_lines_to_cell(cell, text: str, comments: list[str]):
+    lines = [line for line in (text or "").split("\n") if line.strip()]
+    if not lines:
+        return
+    # 빈 값 칸(기본 빈 문단 하나만 있는 상태)이면 그 문단을 그대로 재사용해서, 안 그러면
+    # 생기는 불필요한 첫 줄 공백(빈 문단 + 새 문단)을 피한다.
+    was_empty = not cell.text.strip()
+    first_line, rest = lines[0], lines[1:]
+    target_p = cell.paragraphs[0] if was_empty else cell.add_paragraph()
+    _add_body_text(target_p, first_line, comments)
+    for line in rest:
+        _add_body_text(cell.add_paragraph(), line, comments)
+
+
 def fill_docx_template(template_bytes: bytes, sections: dict) -> dict:
-    """공고에 첨부된 실제 .docx 신청서 양식을 받아, 그 문서 안의 항목(제목/라벨) 바로
-    아래에 AI가 작성한 해당 섹션 내용을 직접 삽입한다. build_docx()처럼 새 문서를 만드는
+    """공고에 첨부된 실제 .docx 신청서 양식을 받아, 그 문서 안의 항목(제목/라벨/표의 값 칸)
+    자리에 AI가 작성한 해당 섹션 내용을 직접 삽입한다. build_docx()처럼 새 문서를 만드는
     대신, 원본 양식의 서식(표, 안내문 등)을 그대로 보존한 채 내용만 끼워 넣는 것이 목적이다.
 
     양식에서 위치를 찾지 못한 항목은 버리지 않고 문서 끝에 별도로 덧붙인다.
     반환값: {"buffer": io.BytesIO, "unmatched": [매칭 안 된 항목명, ...]}
     """
     doc = Document(io.BytesIO(template_bytes))
-    original_paragraphs = list(doc.paragraphs)
-
-    paragraph_list = [
-        {"index": i, "text": p.text.strip()[:100]}
-        for i, p in enumerate(original_paragraphs)
-        if p.text.strip()
-    ]
+    targets = _collect_fill_targets(doc)
 
     mapping = {}
-    if paragraph_list and sections:
+    if targets and sections:
         prompt = TEMPLATE_MAP_PROMPT.format(
-            paragraphs_json=json.dumps(paragraph_list, ensure_ascii=False),
+            targets_json=json.dumps(
+                [{"index": t["index"], "kind": t["kind"], "label": t["label"]} for t in targets],
+                ensure_ascii=False,
+            ),
             section_names_json=json.dumps(list(sections.keys()), ensure_ascii=False),
         )
+        # 표 구조 파악 등 문서 구조 추론이 필요해 단순 추출용 lite 모델 대신 상위 모델을 쓴다.
         response = ai_client.models.generate_content(
-            model=ANALYSIS_MODEL,
+            model=WRITING_MODEL,
             contents=prompt,
             config={"response_mime_type": "application/json"},
         )
@@ -574,17 +626,21 @@ def fill_docx_template(template_bytes: bytes, sections: dict) -> dict:
         except (TypeError, ValueError):
             idx = -1
 
-        if idx < 0 or idx >= len(original_paragraphs):
+        if idx < 0 or idx >= len(targets):
             unmatched.append(name)
             continue
 
-        insert_after = original_paragraphs[idx]
-        for line in (text or "").split("\n"):
-            if not line.strip():
-                continue
-            new_p = _insert_paragraph_after(insert_after)
-            _add_body_text(new_p, line, comments)
-            insert_after = new_p
+        target = targets[idx]
+        if target["kind"] == "table_cell":
+            _append_lines_to_cell(target["ref"], text, comments)
+        else:
+            insert_after = target["ref"]
+            for line in (text or "").split("\n"):
+                if not line.strip():
+                    continue
+                new_p = _insert_paragraph_after(insert_after)
+                _add_body_text(new_p, line, comments)
+                insert_after = new_p
 
     if unmatched:
         doc.add_paragraph()
