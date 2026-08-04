@@ -34,6 +34,8 @@ def _reset_downstream_state():
     st.session_state.aw_draft_sections = None
     st.session_state.aw_draft_chat_history = []
     st.session_state.aw_draft_id = None
+    st.session_state.aw_filled_docx = None
+    st.session_state.aw_filled_docx_name = None
 
 
 for key, default in {
@@ -48,6 +50,8 @@ for key, default in {
     "aw_draft_chat_history": [],
     "aw_draft_id": None,
     "aw_pending_updates": None,
+    "aw_filled_docx": None,
+    "aw_filled_docx_name": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -88,6 +92,8 @@ with st.expander("📂 저장된 초안 불러오기 (이어서 작성)"):
             st.session_state.aw_form_text = ""
             st.session_state.aw_form_images = []
             st.session_state.aw_draft_chat_history = []
+            st.session_state.aw_filled_docx = None
+            st.session_state.aw_filled_docx_name = None
             for name, text in st.session_state.aw_draft_sections.items():
                 st.session_state[_section_key(name)] = text
             st.session_state["aw_extra_text_input"] = st.session_state.aw_extra_context
@@ -389,3 +395,53 @@ if st.session_state.aw_draft_sections:
             file_name=f"{ann.get('title') or '신청서'}_초안.docx",
             mime=DOCX_MIME,
         )
+
+    # 공고에 첨부된 파일 중 .docx 양식이 있으면, 새 문서를 만드는 대신 그 원본 양식
+    # 안의 항목 바로 아래에 내용을 직접 채워 넣을 수 있게 한다 (docx만 지원 - hwp/pdf는
+    # 프로그램적으로 값을 채우기가 훨씬 어려워 범위에서 제외).
+    docx_attachments = [
+        a
+        for a in (
+            ann.get("attachments")
+            or ([{"filename": ann.get("attachment_filename"), "url": ann.get("attachment_url")}] if ann.get("attachment_url") else [])
+        )
+        if a.get("url") and (a.get("filename") or "").lower().endswith(".docx")
+    ]
+
+    st.divider()
+    st.markdown("**📝 공고 첨부 양식(.docx)에 바로 채워넣기**")
+    if not docx_attachments:
+        st.caption("이 공고의 첨부파일 중 .docx 형식 양식이 없어 사용할 수 없습니다. 위의 구조화된 초안을 이용해 주세요.")
+    else:
+        if len(docx_attachments) == 1:
+            selected_template = docx_attachments[0]
+            st.caption(f"대상 양식: {selected_template.get('filename')}")
+        else:
+            template_options = {a["filename"]: a for a in docx_attachments}
+            template_label = st.selectbox("채워넣을 양식 파일 선택", list(template_options.keys()), key="aw_template_select")
+            selected_template = template_options[template_label]
+
+        if st.button("📝 이 양식에 채워넣기"):
+            with st.spinner("양식을 내려받아 항목 위치를 찾고 내용을 채우는 중..."):
+                try:
+                    template_bytes = application_writer.fetch_docx_bytes(selected_template["url"])
+                    fill_result = application_writer.fill_docx_template(template_bytes, _current_sections())
+                    st.session_state.aw_filled_docx = fill_result["buffer"].getvalue()
+                    st.session_state.aw_filled_docx_name = selected_template["filename"]
+                    if fill_result["unmatched"]:
+                        st.warning(
+                            "다음 항목은 양식에서 알맞은 위치를 찾지 못해 문서 끝에 추가했습니다: "
+                            + ", ".join(fill_result["unmatched"])
+                        )
+                    else:
+                        st.success("양식의 모든 항목을 채웠습니다.")
+                except Exception as e:
+                    st.error(f"양식 채우기 중 오류가 발생했습니다: {e}")
+
+        if st.session_state.aw_filled_docx:
+            st.download_button(
+                f"📥 채워진 {st.session_state.aw_filled_docx_name} 다운로드",
+                data=st.session_state.aw_filled_docx,
+                file_name=f"채움_{st.session_state.aw_filled_docx_name}",
+                mime=DOCX_MIME,
+            )

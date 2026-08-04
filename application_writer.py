@@ -20,8 +20,10 @@ from docx.opc.part import Part
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
+from docx.text.paragraph import Paragraph
 from dotenv import load_dotenv
 from lxml import etree
+import requests
 
 import matcher
 
@@ -119,6 +121,23 @@ REFINE_CHAT_PROMPT_TEMPLATE = """
   "updated_sections": {{"수정한 항목명": "새 본문", "...": "..."}}
 }}
 사용자 요청이 특정 항목과 무관한 일반 질문/답변이면 updated_sections는 빈 객체({{}})로 두고 reply에만 답하세요.
+"""
+
+TEMPLATE_MAP_PROMPT = """
+아래는 워드(.docx) 신청서 양식의 문단 목록(번호: 내용)입니다. 그리고 신청서 초안의 작성 항목 목록이
+있습니다. 각 작성 항목의 내용이 양식의 어떤 문단(제목/라벨/질문) 바로 다음에 들어가야 자연스러운지
+찾아서 매핑하세요. 해당하는 문단을 찾을 수 없으면 -1로 표시하세요. 서로 다른 항목을 같은 문단에
+매핑하지 마세요.
+
+[양식 문단 목록]
+{paragraphs_json}
+
+[작성 항목 목록]
+{section_names_json}
+
+[출력 형식]
+반드시 아래 JSON 형식으로만 답하세요. 키는 위 "작성 항목 목록"의 이름과 정확히 일치시키세요.
+{{"<항목명>": <문단번호 또는 -1>, "...": ...}}
 """
 
 
@@ -490,3 +509,94 @@ def build_docx(announcement: dict, company_profile: dict, sections: dict) -> io.
     doc.save(buf)
     buf.seek(0)
     return buf
+
+
+def fetch_docx_bytes(url: str) -> bytes:
+    resp = requests.get(url, timeout=20)
+    resp.raise_for_status()
+    return resp.content
+
+
+def _insert_paragraph_after(paragraph: Paragraph) -> Paragraph:
+    """python-docx엔 '이 문단 뒤에 새 문단 삽입' API가 없어서(항상 문서 끝에만 추가 가능),
+    같은 위치에 원소를 만들어 addnext로 옆에 꽂아주는 방식으로 직접 구현한다."""
+    new_p = OxmlElement("w:p")
+    paragraph._p.addnext(new_p)
+    return Paragraph(new_p, paragraph._parent)
+
+
+def fill_docx_template(template_bytes: bytes, sections: dict) -> dict:
+    """공고에 첨부된 실제 .docx 신청서 양식을 받아, 그 문서 안의 항목(제목/라벨) 바로
+    아래에 AI가 작성한 해당 섹션 내용을 직접 삽입한다. build_docx()처럼 새 문서를 만드는
+    대신, 원본 양식의 서식(표, 안내문 등)을 그대로 보존한 채 내용만 끼워 넣는 것이 목적이다.
+
+    양식에서 위치를 찾지 못한 항목은 버리지 않고 문서 끝에 별도로 덧붙인다.
+    반환값: {"buffer": io.BytesIO, "unmatched": [매칭 안 된 항목명, ...]}
+    """
+    doc = Document(io.BytesIO(template_bytes))
+    original_paragraphs = list(doc.paragraphs)
+
+    paragraph_list = [
+        {"index": i, "text": p.text.strip()[:100]}
+        for i, p in enumerate(original_paragraphs)
+        if p.text.strip()
+    ]
+
+    mapping = {}
+    if paragraph_list and sections:
+        prompt = TEMPLATE_MAP_PROMPT.format(
+            paragraphs_json=json.dumps(paragraph_list, ensure_ascii=False),
+            section_names_json=json.dumps(list(sections.keys()), ensure_ascii=False),
+        )
+        response = ai_client.models.generate_content(
+            model=ANALYSIS_MODEL,
+            contents=prompt,
+            config={"response_mime_type": "application/json"},
+        )
+        mapping = _parse_json_response(response)
+
+    comments: list[str] = []
+    unmatched = []
+    for name, text in sections.items():
+        try:
+            idx = int(mapping.get(name, -1))
+        except (TypeError, ValueError):
+            idx = -1
+
+        if idx < 0 or idx >= len(original_paragraphs):
+            unmatched.append(name)
+            continue
+
+        insert_after = original_paragraphs[idx]
+        for line in (text or "").split("\n"):
+            if not line.strip():
+                continue
+            new_p = _insert_paragraph_after(insert_after)
+            _add_body_text(new_p, line, comments)
+            insert_after = new_p
+
+    if unmatched:
+        doc.add_paragraph()
+        note_p = doc.add_paragraph()
+        note_run = note_p.add_run(
+            "※ 아래 항목은 양식에서 알맞은 위치를 찾지 못해 문서 끝에 추가했습니다. 적절한 위치로 직접 옮겨 주세요."
+        )
+        note_run.italic = True
+        note_run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
+        for name in unmatched:
+            heading_p = doc.add_paragraph(style=doc.styles["Heading 2"])
+            _add_left_accent_border(heading_p)
+            heading_run = heading_p.add_run(name)
+            heading_run.bold = True
+            heading_run.font.color.rgb = DOCX_NAVY
+            for line in (sections.get(name) or "").split("\n"):
+                if line.strip():
+                    body_p = doc.add_paragraph()
+                    _add_body_text(body_p, line, comments)
+
+    _attach_comments(doc, comments)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return {"buffer": buf, "unmatched": unmatched}
