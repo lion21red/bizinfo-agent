@@ -557,21 +557,39 @@ def _collect_fill_targets(doc: Document) -> list[dict]:
             targets.append({"index": len(targets), "kind": "paragraph", "ref": p, "label": text[:150]})
 
     for table in doc.tables:
-        for row in table.rows:
+        rows = table.rows
+        for r_idx, row in enumerate(rows):
             cells = row.cells
             for c_idx, cell in enumerate(cells):
                 label_text = cell.text.strip()
-                if not label_text or c_idx + 1 >= len(cells):
+                if not label_text:
                     continue
-                value_cell = cells[c_idx + 1]
-                if value_cell._tc is cell._tc:
-                    continue  # 가로 병합된 칸 - 같은 칸을 라벨로 또 잡지 않는다
-                targets.append({
-                    "index": len(targets),
-                    "kind": "table_cell",
-                    "ref": value_cell,
-                    "label": f"[표] {label_text[:150]}",
-                })
+
+                # 패턴 1: [라벨 칸 | 값 칸] 같은 행에 나란히 있는 경우 (가장 흔함)
+                if c_idx + 1 < len(cells):
+                    value_cell = cells[c_idx + 1]
+                    if value_cell._tc is not cell._tc:  # 가로 병합된 칸이면 제외
+                        targets.append({
+                            "index": len(targets),
+                            "kind": "table_cell",
+                            "ref": value_cell,
+                            "label": f"[표] {label_text[:150]}",
+                        })
+
+                # 패턴 2: 라벨 행 바로 아래 빈 행이 값 칸인 경우 (예: '사업 개요' 행 다음에
+                # 서술을 적는 빈 행). 이미 값이 있는 칸을 후보로 잡으면 원본 내용을 덮어쓸
+                # 위험이 있으니, 비어 있는 칸일 때만 후보로 넣는다.
+                if r_idx + 1 < len(rows):
+                    below_cells = rows[r_idx + 1].cells
+                    if c_idx < len(below_cells):
+                        below_cell = below_cells[c_idx]
+                        if below_cell._tc is not cell._tc and not below_cell.text.strip():
+                            targets.append({
+                                "index": len(targets),
+                                "kind": "table_cell",
+                                "ref": below_cell,
+                                "label": f"[표, 아래 칸] {label_text[:150]}",
+                            })
 
     return targets
 
@@ -595,8 +613,10 @@ def fill_docx_template(template_bytes: bytes, sections: dict) -> dict:
     자리에 AI가 작성한 해당 섹션 내용을 직접 삽입한다. build_docx()처럼 새 문서를 만드는
     대신, 원본 양식의 서식(표, 안내문 등)을 그대로 보존한 채 내용만 끼워 넣는 것이 목적이다.
 
-    양식에서 위치를 찾지 못한 항목은 버리지 않고 문서 끝에 별도로 덧붙인다.
-    반환값: {"buffer": io.BytesIO, "unmatched": [매칭 안 된 항목명, ...]}
+    양식에서 위치를 찾지 못한 항목은 버리지 않고 문서 끝에 별도로 덧붙인다. matched에는
+    어떤 항목이 양식의 어느 라벨 자리에 들어갔는지 적어두는데, 자동 매칭이 문서를 열어보지
+    않고도 맞았는지 바로 확인할 수 있어야 신뢰할 수 있기 때문이다.
+    반환값: {"buffer": io.BytesIO, "unmatched": [...], "matched": [{"section": ..., "target_label": ...}, ...]}
     """
     doc = Document(io.BytesIO(template_bytes))
     targets = _collect_fill_targets(doc)
@@ -620,6 +640,7 @@ def fill_docx_template(template_bytes: bytes, sections: dict) -> dict:
 
     comments: list[str] = []
     unmatched = []
+    matched = []
     for name, text in sections.items():
         try:
             idx = int(mapping.get(name, -1))
@@ -631,6 +652,7 @@ def fill_docx_template(template_bytes: bytes, sections: dict) -> dict:
             continue
 
         target = targets[idx]
+        matched.append({"section": name, "target_label": target["label"]})
         if target["kind"] == "table_cell":
             _append_lines_to_cell(target["ref"], text, comments)
         else:
@@ -666,4 +688,4 @@ def fill_docx_template(template_bytes: bytes, sections: dict) -> dict:
     buf = io.BytesIO()
     doc.save(buf)
     buf.seek(0)
-    return {"buffer": buf, "unmatched": unmatched}
+    return {"buffer": buf, "unmatched": unmatched, "matched": matched}

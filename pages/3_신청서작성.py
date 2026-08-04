@@ -36,6 +36,7 @@ def _reset_downstream_state():
     st.session_state.aw_draft_id = None
     st.session_state.aw_filled_docx = None
     st.session_state.aw_filled_docx_name = None
+    st.session_state.aw_filled_docx_matched = None
 
 
 for key, default in {
@@ -52,6 +53,7 @@ for key, default in {
     "aw_pending_updates": None,
     "aw_filled_docx": None,
     "aw_filled_docx_name": None,
+    "aw_filled_docx_matched": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -94,6 +96,7 @@ with st.expander("📂 저장된 초안 불러오기 (이어서 작성)"):
             st.session_state.aw_draft_chat_history = []
             st.session_state.aw_filled_docx = None
             st.session_state.aw_filled_docx_name = None
+            st.session_state.aw_filled_docx_matched = None
             for name, text in st.session_state.aw_draft_sections.items():
                 st.session_state[_section_key(name)] = text
             st.session_state["aw_extra_text_input"] = st.session_state.aw_extra_context
@@ -437,6 +440,7 @@ if st.session_state.aw_draft_sections:
                 fill_result = application_writer.fill_docx_template(template_bytes, _current_sections())
                 st.session_state.aw_filled_docx = fill_result["buffer"].getvalue()
                 st.session_state.aw_filled_docx_name = template_name
+                st.session_state.aw_filled_docx_matched = fill_result["matched"]
                 if fill_result["unmatched"]:
                     st.warning(
                         "다음 항목은 양식에서 알맞은 위치를 찾지 못해 문서 끝에 추가했습니다: "
@@ -454,3 +458,8 @@ if st.session_state.aw_draft_sections:
             file_name=f"채움_{st.session_state.aw_filled_docx_name}",
             mime=DOCX_MIME,
         )
+        if st.session_state.aw_filled_docx_matched:
+            with st.expander("🔍 매칭 결과 확인 (문서를 열어보지 않고 위치가 맞는지 미리 확인)"):
+                for m in st.session_state.aw_filled_docx_matched:
+                    st.markdown(f"- **{m['section']}** → {m['target_label']}")
+                st.caption("위치가 잘못됐다면 다운로드한 문서에서 직접 옮기거나, 위 초안을 수정한 뒤 다시 채워넣기를 눌러 주세요.")
