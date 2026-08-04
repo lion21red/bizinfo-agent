@@ -394,6 +394,17 @@ def _lock_table_layout(table, total_width: "Cm"):
     tbl_w.set(qn("w:w"), str(total_width.twips))
 
 
+def _style_or_none(doc: Document, style_name: str):
+    """이름으로 스타일을 찾되, 없으면 None을 반환한다 (add_paragraph(style=None)은 '기본'
+    스타일이 되어 에러 없이 동작함). 우리가 새로 만드는 문서(build_docx)는 python-docx의
+    기본 템플릿을 쓰므로 'Heading 2'가 항상 있지만, 사용자가 올리거나 공고에서 내려받은
+    기존 .docx 양식(fill_docx_template)은 정의된 스타일이 제각각이라 없을 수 있다."""
+    try:
+        return doc.styles[style_name]
+    except KeyError:
+        return None
+
+
 def _add_page_number_footer(doc: Document):
     footer_p = doc.sections[0].footer.paragraphs[0]
     footer_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -485,7 +496,7 @@ def build_docx(announcement: dict, company_profile: dict, sections: dict) -> io.
         # 실제 "제목 2" 스타일을 적용해두면 Word의 탐색 창(개요)에 섹션이 잡히고,
         # 나중에 목차(TOC)를 넣어도 자동으로 인식된다 - 색상/테두리는 이후 직접 다시 덮어써서
         # 스타일 적용 여부와 무관하게 지금까지의 디자인을 그대로 유지한다.
-        heading_p = doc.add_paragraph(style=doc.styles["Heading 2"])
+        heading_p = doc.add_paragraph(style=_style_or_none(doc, "Heading 2"))
         heading_p.paragraph_format.space_before = Pt(18)
         heading_p.paragraph_format.space_after = Pt(6)
         _add_left_accent_border(heading_p)
@@ -584,7 +595,7 @@ def fill_docx_template(template_bytes: bytes, sections: dict) -> dict:
         note_run.italic = True
         note_run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
         for name in unmatched:
-            heading_p = doc.add_paragraph(style=doc.styles["Heading 2"])
+            heading_p = doc.add_paragraph(style=_style_or_none(doc, "Heading 2"))
             _add_left_accent_border(heading_p)
             heading_run = heading_p.add_run(name)
             heading_run.bold = True
