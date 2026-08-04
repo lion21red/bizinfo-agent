@@ -409,10 +409,11 @@ if st.session_state.aw_draft_sections:
     ]
 
     st.divider()
-    st.markdown("**📝 공고 첨부 양식(.docx)에 바로 채워넣기**")
-    if not docx_attachments:
-        st.caption("이 공고의 첨부파일 중 .docx 형식 양식이 없어 사용할 수 없습니다. 위의 구조화된 초안을 이용해 주세요.")
-    else:
+    st.markdown("**📝 신청서 양식(.docx)에 바로 채워넣기**")
+
+    template_bytes = None
+    template_name = None
+    if docx_attachments:
         if len(docx_attachments) == 1:
             selected_template = docx_attachments[0]
             st.caption(f"대상 양식: {selected_template.get('filename')}")
@@ -420,28 +421,36 @@ if st.session_state.aw_draft_sections:
             template_options = {a["filename"]: a for a in docx_attachments}
             template_label = st.selectbox("채워넣을 양식 파일 선택", list(template_options.keys()), key="aw_template_select")
             selected_template = template_options[template_label]
+        template_name = selected_template.get("filename")
+    else:
+        st.caption("이 공고의 첨부파일 중 .docx 형식 양식이 없습니다. 직접 가지고 있는 신청서 양식(.docx)을 업로드해 주세요.")
+        uploaded_template = st.file_uploader("신청서 양식 업로드 (.docx)", type=["docx"], key="aw_template_uploader")
+        if uploaded_template is not None:
+            template_bytes = uploaded_template.read()
+            template_name = uploaded_template.name
 
-        if st.button("📝 이 양식에 채워넣기"):
-            with st.spinner("양식을 내려받아 항목 위치를 찾고 내용을 채우는 중..."):
-                try:
+    if st.button("📝 이 양식에 채워넣기", disabled=not (docx_attachments or template_bytes)):
+        with st.spinner("양식의 항목 위치를 찾고 내용을 채우는 중..."):
+            try:
+                if template_bytes is None:
                     template_bytes = application_writer.fetch_docx_bytes(selected_template["url"])
-                    fill_result = application_writer.fill_docx_template(template_bytes, _current_sections())
-                    st.session_state.aw_filled_docx = fill_result["buffer"].getvalue()
-                    st.session_state.aw_filled_docx_name = selected_template["filename"]
-                    if fill_result["unmatched"]:
-                        st.warning(
-                            "다음 항목은 양식에서 알맞은 위치를 찾지 못해 문서 끝에 추가했습니다: "
-                            + ", ".join(fill_result["unmatched"])
-                        )
-                    else:
-                        st.success("양식의 모든 항목을 채웠습니다.")
-                except Exception as e:
-                    st.error(f"양식 채우기 중 오류가 발생했습니다: {e}")
+                fill_result = application_writer.fill_docx_template(template_bytes, _current_sections())
+                st.session_state.aw_filled_docx = fill_result["buffer"].getvalue()
+                st.session_state.aw_filled_docx_name = template_name
+                if fill_result["unmatched"]:
+                    st.warning(
+                        "다음 항목은 양식에서 알맞은 위치를 찾지 못해 문서 끝에 추가했습니다: "
+                        + ", ".join(fill_result["unmatched"])
+                    )
+                else:
+                    st.success("양식의 모든 항목을 채웠습니다.")
+            except Exception as e:
+                st.error(f"양식 채우기 중 오류가 발생했습니다: {e}")
 
-        if st.session_state.aw_filled_docx:
-            st.download_button(
-                f"📥 채워진 {st.session_state.aw_filled_docx_name} 다운로드",
-                data=st.session_state.aw_filled_docx,
-                file_name=f"채움_{st.session_state.aw_filled_docx_name}",
-                mime=DOCX_MIME,
-            )
+    if st.session_state.aw_filled_docx:
+        st.download_button(
+            f"📥 채워진 {st.session_state.aw_filled_docx_name} 다운로드",
+            data=st.session_state.aw_filled_docx,
+            file_name=f"채움_{st.session_state.aw_filled_docx_name}",
+            mime=DOCX_MIME,
+        )
