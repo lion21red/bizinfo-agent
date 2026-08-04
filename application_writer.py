@@ -14,10 +14,14 @@ from google import genai
 from docx import Document
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.opc.constants import CONTENT_TYPE as OPC_CONTENT_TYPE, RELATIONSHIP_TYPE as RT
+from docx.opc.packuri import PackURI
+from docx.opc.part import Part
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
 from dotenv import load_dotenv
+from lxml import etree
 
 import matcher
 
@@ -282,9 +286,11 @@ def _add_left_accent_border(paragraph, color_hex: str = "1F3A63"):
     p_pr.append(p_bdr)
 
 
-def _add_body_text(paragraph, text: str):
-    """'[확인 필요: ...]' 표시는 빨간 굵은 글씨로 강조해, 제출 전 채워 넣어야 할 부분이
-    문서만 봐도 바로 눈에 띄게 한다."""
+def _add_body_text(paragraph, text: str, comments: list):
+    """'[확인 필요: ...]' 표시는 빨간 굵은 글씨로 강조해 본문만 봐도 바로 눈에 띄게 하고,
+    동시에 실제 Word 댓글(주석)로도 anchor해 검토자가 댓글 패널에서 하나씩 확인하며
+    지워나갈 수 있게 한다. comments 리스트에 (댓글 본문)을 순서대로 쌓아두면,
+    문서 전체를 다 만든 뒤 _attach_comments()가 실제 comments.xml 파트로 묶어 붙인다."""
     for part in _PLACEHOLDER_RE.split(text):
         if not part:
             continue
@@ -292,6 +298,81 @@ def _add_body_text(paragraph, text: str):
         if _PLACEHOLDER_RE.match(part):
             run.bold = True
             run.font.color.rgb = DOCX_PLACEHOLDER_COLOR
+            inner = re.sub(r"^확인\s*필요\s*:?\s*", "", part.strip("[]"))
+            comment_id = len(comments)
+            comments.append(f"⚠️ 검토 필요 — 실제 정보로 채워 넣어 주세요: {inner}")
+            _anchor_comment(run, comment_id)
+
+
+def _anchor_comment(run, comment_id: int):
+    """run 하나를 commentRangeStart/End + commentReference로 감싸, comments.xml의
+    같은 id를 가진 댓글과 연결한다 (python-docx엔 댓글 API가 없어 원시 OOXML로 직접 구성)."""
+    start = OxmlElement("w:commentRangeStart")
+    start.set(qn("w:id"), str(comment_id))
+    end = OxmlElement("w:commentRangeEnd")
+    end.set(qn("w:id"), str(comment_id))
+
+    ref_run = OxmlElement("w:r")
+    ref_rpr = OxmlElement("w:rPr")
+    rstyle = OxmlElement("w:rStyle")
+    rstyle.set(qn("w:val"), "CommentReference")
+    ref_rpr.append(rstyle)
+    ref_run.append(ref_rpr)
+    ref = OxmlElement("w:commentReference")
+    ref.set(qn("w:id"), str(comment_id))
+    ref_run.append(ref)
+
+    run._r.addprevious(start)
+    run._r.addnext(end)
+    end.addnext(ref_run)
+
+
+def _attach_comments(doc: Document, comment_texts: list[str]):
+    """수집된 댓글 목록을 실제 word/comments.xml 파트로 만들어 문서 패키지에 연결한다.
+    python-docx는 댓글을 직접 다루는 API가 없어서, OPC(Open Packaging Convention) 레벨에서
+    파트를 만들고 관계(relationship)를 맺어주면 된다 - 그러면 [Content_Types].xml과
+    document.xml.rels는 python-docx가 저장 시점에 알아서 채워준다."""
+    if not comment_texts:
+        return
+
+    comments_el = OxmlElement("w:comments")
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for i, text in enumerate(comment_texts):
+        comment = OxmlElement("w:comment")
+        comment.set(qn("w:id"), str(i))
+        comment.set(qn("w:author"), "AI 초안 검토")
+        comment.set(qn("w:date"), now)
+        comment.set(qn("w:initials"), "AI")
+        p = OxmlElement("w:p")
+        r = OxmlElement("w:r")
+        t = OxmlElement("w:t")
+        t.text = text
+        r.append(t)
+        p.append(r)
+        comment.append(p)
+        comments_el.append(comment)
+
+    blob = etree.tostring(comments_el, xml_declaration=True, encoding="UTF-8", standalone=True)
+    comments_part = Part(
+        PackURI("/word/comments.xml"), OPC_CONTENT_TYPE.WML_COMMENTS, blob, doc.part.package
+    )
+    doc.part.relate_to(comments_part, RT.COMMENTS)
+
+
+def _lock_table_layout(table, total_width: "Cm"):
+    """표 너비를 '고정'으로 잠그고 전체 너비를 명시한다. python-docx 기본값인 자동맞춤
+    (autofit)은 Word에서는 대체로 괜찮지만 Google Docs 등 다른 뷰어에서 셀 너비 지정을
+    무시하고 내용 기준으로 다시 배치해버리는 경우가 있어, 뷰어에 관계없이 레이아웃이 일정
+    하게 나오도록 고정폭으로 강제한다. python-docx의 Table에는 width 속성이 없어(1.2.0
+    기준) tblW를 OOXML로 직접 써야 한다."""
+    table.autofit = False
+    tbl_pr = table._tbl.tblPr
+    tbl_w = tbl_pr.find(qn("w:tblW"))
+    if tbl_w is None:
+        tbl_w = OxmlElement("w:tblW")
+        tbl_pr.append(tbl_w)
+    tbl_w.set(qn("w:type"), "dxa")
+    tbl_w.set(qn("w:w"), str(total_width.twips))
 
 
 def _add_page_number_footer(doc: Document):
@@ -335,6 +416,7 @@ def build_docx(announcement: dict, company_profile: dict, sections: dict) -> io.
     # 제목 배너
     banner = doc.add_table(rows=1, cols=1)
     banner.alignment = WD_TABLE_ALIGNMENT.CENTER
+    _lock_table_layout(banner, Cm(16.7))
     banner_cell = banner.rows[0].cells[0]
     _set_cell_background(banner_cell, "1F3A63")
     title_p = banner_cell.paragraphs[0]
@@ -358,6 +440,7 @@ def build_docx(announcement: dict, company_profile: dict, sections: dict) -> io.
     ]
     meta_table = doc.add_table(rows=len(meta_rows), cols=2)
     meta_table.style = "Table Grid"
+    _lock_table_layout(meta_table, Cm(14.7))
     for row, (label, value) in zip(meta_table.rows, meta_rows):
         label_cell, value_cell = row.cells
         label_cell.width = Cm(3.2)
@@ -378,8 +461,12 @@ def build_docx(announcement: dict, company_profile: dict, sections: dict) -> io.
     note_run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
 
     # 섹션 본문
+    comments: list[str] = []
     for idx, (name, text) in enumerate(sections.items(), start=1):
-        heading_p = doc.add_paragraph()
+        # 실제 "제목 2" 스타일을 적용해두면 Word의 탐색 창(개요)에 섹션이 잡히고,
+        # 나중에 목차(TOC)를 넣어도 자동으로 인식된다 - 색상/테두리는 이후 직접 다시 덮어써서
+        # 스타일 적용 여부와 무관하게 지금까지의 디자인을 그대로 유지한다.
+        heading_p = doc.add_paragraph(style=doc.styles["Heading 2"])
         heading_p.paragraph_format.space_before = Pt(18)
         heading_p.paragraph_format.space_after = Pt(6)
         _add_left_accent_border(heading_p)
@@ -394,9 +481,10 @@ def build_docx(announcement: dict, company_profile: dict, sections: dict) -> io.
             body_p = doc.add_paragraph()
             body_p.paragraph_format.line_spacing = 1.3
             body_p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-            _add_body_text(body_p, para_text)
+            _add_body_text(body_p, para_text, comments)
 
     _add_page_number_footer(doc)
+    _attach_comments(doc, comments)
 
     buf = io.BytesIO()
     doc.save(buf)
