@@ -467,26 +467,45 @@ def build_docx(announcement: dict, company_profile: dict, sections: dict) -> io.
 
     doc.add_paragraph()
 
-    # 메타정보 표
-    meta_rows = [
-        ("소관기관", announcement.get("department") or "정보 없음"),
-        ("신청기업", company_profile.get("company_name") or "정보 없음"),
-        ("공고 원문", announcement.get("detail_url") or "-"),
-        ("작성일", datetime.now().strftime("%Y-%m-%d")),
-    ]
-    meta_table = doc.add_table(rows=len(meta_rows), cols=2)
-    meta_table.style = "Table Grid"
-    _lock_table_layout(meta_table, Cm(14.7))
-    for row, (label, value) in zip(meta_table.rows, meta_rows):
-        label_cell, value_cell = row.cells
-        label_cell.width = Cm(3.2)
-        value_cell.width = Cm(11.5)
-        _set_cell_background(label_cell, DOCX_LIGHT_BLUE)
-        label_run = label_cell.paragraphs[0].add_run(label)
+    def _add_info_table(subsection_label: str, rows: list[tuple[str, str]]):
+        label_p = doc.add_paragraph()
+        label_run = label_p.add_run(f"▸ {subsection_label}")
         label_run.bold = True
-        value_cell.paragraphs[0].add_run(str(value))
+        label_run.font.size = Pt(11)
+        label_run.font.color.rgb = DOCX_NAVY
 
-    doc.add_paragraph()
+        table = doc.add_table(rows=len(rows), cols=2)
+        table.style = "Table Grid"
+        _lock_table_layout(table, Cm(14.7))
+        for row, (label, value) in zip(table.rows, rows):
+            label_cell, value_cell = row.cells
+            label_cell.width = Cm(3.2)
+            value_cell.width = Cm(11.5)
+            _set_cell_background(label_cell, DOCX_LIGHT_BLUE)
+            lrun = label_cell.paragraphs[0].add_run(label)
+            lrun.bold = True
+            value_cell.paragraphs[0].add_run(str(value) if value not in (None, "") else "정보 없음")
+        doc.add_paragraph()
+
+    _add_info_table("지원사업 정보", [
+        ("지원사업명", title),
+        ("소관기관", announcement.get("department")),
+        ("공고 원문", announcement.get("detail_url") or "-"),
+    ])
+
+    _add_info_table("기업체 현황", [
+        ("기업체명", company_profile.get("company_name")),
+        ("대표자", company_profile.get("ceo_name")),
+        ("설립일자", company_profile.get("establishment_date")),
+        ("주소", company_profile.get("region")),
+        ("업종", company_profile.get("industry")),
+        ("기업 형태", company_profile.get("business_entity_type")),
+        ("상시 근로자 수", f"{company_profile['employee_count']}명" if company_profile.get("employee_count") else None),
+    ])
+
+    _add_info_table("문서 정보", [
+        ("작성일", datetime.now().strftime("%Y-%m-%d")),
+    ])
 
     note_p = doc.add_paragraph()
     note_run = note_p.add_run(

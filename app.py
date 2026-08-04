@@ -33,6 +33,7 @@ PROFILE_PROMPT_TEMPLATE = """
   "is_venture": "벤처기업 인증 여부 (true/false)",
   "is_female_owned": "여성기업 여부 (true/false)",
   "patent_count": "보유 특허 건수 (숫자, 확인 불가시 0)",
+  "ceo_name": "대표자 성명 (확인 불가시 null)",
   "ceo_birth_year": "대표자 출생연도 (YYYY 숫자만, 확인 불가시 null)",
   "org_type": "조직형태 (예: 일반기업, 사회적기업, 협동조합, 마을기업 등. 확인 불가시 '일반기업')",
   "has_export_experience": "수출 실적 보유 여부 (true/false)",
@@ -146,6 +147,7 @@ def save_company(profile: dict):
         "is_venture": profile["is_venture"],
         "is_female_owned": profile["is_female_owned"],
         "patent_count": profile["patent_count"],
+        "ceo_name": profile.get("ceo_name") or None,
         "ceo_birth_year": profile.get("ceo_birth_year") or None,
         "org_type": profile.get("org_type") or "일반기업",
         "has_export_experience": profile.get("has_export_experience", False),
@@ -210,6 +212,7 @@ with st.expander("💾 저장된 기업 불러오기"):
                 "is_venture": c["is_venture"],
                 "is_female_owned": c["is_female_owned"],
                 "patent_count": c["patent_count"],
+                "ceo_name": c.get("ceo_name"),
                 "ceo_birth_year": c.get("ceo_birth_year"),
                 "org_type": c.get("org_type"),
                 "has_export_experience": c.get("has_export_experience"),
@@ -338,6 +341,7 @@ if st.session_state.profile:
     col1, col2, col3 = st.columns(3)
     with col1:
         company_name = st.text_input("기업명", p.get("company_name") or "")
+        ceo_name = st.text_input("대표자 성명", p.get("ceo_name") or "")
         establishment_date = st.text_input(
             "설립일 (YYYY-MM-DD)", "" if is_pre_founder else (p.get("establishment_date") or ""),
             disabled=is_pre_founder,
@@ -376,6 +380,7 @@ if st.session_state.profile:
 
     confirmed_profile = {
         "company_name": company_name,
+        "ceo_name": ceo_name or None,
         "establishment_date": None if is_pre_founder else establishment_date,
         "region": region,
         "industry": industry,
