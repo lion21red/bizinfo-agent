@@ -10,6 +10,7 @@ from google import genai
 
 from pdf_utils import extract_pdf_content
 from hwp_utils import extract_hwp_text
+from docx_utils import extract_docx_text, extract_doc_text
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -30,6 +31,12 @@ ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # 첨부 공고문 PDF 분석 시 이미지로 렌더링할 최대 페이지 수 (비용/시간 제어용)
 MAX_ATTACHMENT_IMAGE_PAGES = 5
+
+# Gemini 프롬프트에 넣는 공고 텍스트(본문+첨부원문)의 최대 길이. gemini-flash-lite-latest는
+# 이보다 훨씬 큰 컨텍스트를 지원하는데 예전에 과도하게 짧게(6000자 ≈ A4 2~3장) 잘라서,
+# 여러 페이지짜리 첨부 공고문의 뒷부분(자격요건 세부사항이 있는 경우가 많음)이 잘려
+# 나가는 경우가 있었다. 40000자(대략 A4 15~20장)로 넉넉히 늘려 이 손실을 줄인다.
+MAX_PROMPT_CONTENT_CHARS = 40000
 
 PROMPT_TEMPLATE = """
 당신은 대한민국 정부 지원사업 전문가입니다. 아래 사업공고 텍스트(및 첨부된 공고문 이미지가 있다면 그 내용까지 함께)를 분석하여 지정된 JSON 형식으로 핵심 요건을 추출하세요. 공고에 명시되지 않은 항목은 추측하지 말고 null 또는 0으로 두세요.
@@ -101,6 +108,23 @@ def fetch_attachment(url: str, filename: str = ""):
             print(f"  └ ⚠️ 한글 문서에서 미리보기 텍스트를 찾지 못했습니다 ({filename})")
         return text, []
 
+    if name.endswith(".docx"):
+        try:
+            return extract_docx_text(resp.content), []
+        except Exception as e:
+            print(f"  └ ⚠️ Word 문서 분석 실패 (본문 요약만으로 진행): {e}")
+            return "", []
+
+    if name.endswith(".doc"):
+        try:
+            text = extract_doc_text(resp.content)
+            if not text:
+                print(f"  └ ⚠️ 구버전 Word(.doc) 분석을 건너뜁니다 (LibreOffice 미설치이거나 변환 실패, {filename})")
+            return text, []
+        except Exception as e:
+            print(f"  └ ⚠️ 구버전 Word(.doc) 분석 실패 (본문 요약만으로 진행): {e}")
+            return "", []
+
     print(f"  └ ℹ️ 지원하지 않는 첨부파일 형식이라 건너뜁니다 ({filename}) - 본문 요약만으로 분석")
     return "", []
 
@@ -116,7 +140,7 @@ def parse_announcement(content: str, images: list | None = None, title: str = ""
     prompt = PROMPT_TEMPLATE.format(
         title=title or "(제목 없음)",
         department=department or "(소관기관 미상)",
-        content=content[:6000],
+        content=content[:MAX_PROMPT_CONTENT_CHARS],
     )
     target_model = "gemini-flash-lite-latest"
 

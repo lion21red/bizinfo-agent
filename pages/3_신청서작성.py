@@ -5,7 +5,21 @@ import matcher
 import parser
 from pdf_utils import extract_pdf_content
 from hwp_utils import extract_hwp_text
+from docx_utils import extract_docx_text, extract_doc_text
 from ui_helpers import render_field_grid
+
+
+def _extract_uploaded_text(name: str, file_bytes: bytes) -> str:
+    """확장자에 맞는 추출기로 텍스트만 뽑는다 (이미지가 필요 없는 업로드 지점 전용)."""
+    name = name.lower()
+    if name.endswith(".pdf"):
+        text, _ = extract_pdf_content(file_bytes)
+        return text
+    if name.endswith(".docx"):
+        return extract_docx_text(file_bytes)
+    if name.endswith(".doc"):
+        return extract_doc_text(file_bytes)
+    return extract_hwp_text(file_bytes)
 
 st.set_page_config(page_title="AI 신청서 작성 도우미", page_icon="📝")
 st.title("📝 AI 신청서 작성 도우미")
@@ -221,17 +235,16 @@ if ann_attachments and st.session_state.aw_ann_attachment is None:
             st.session_state.aw_ann_attachment = ("\n\n".join(combined_text), combined_images[:10])
 
 uploaded_form = st.file_uploader(
-    "신청서 양식 원문이 별도 파일로 있다면 업로드하세요 (PDF/HWP/HWPX)",
-    type=["pdf", "hwp", "hwpx"],
+    "신청서 양식 원문이 별도 파일로 있다면 업로드하세요 (PDF/HWP/HWPX/Word)",
+    type=["pdf", "hwp", "hwpx", "docx", "doc"],
     key="aw_form_uploader",
 )
 if uploaded_form is not None:
-    name = uploaded_form.name.lower()
     file_bytes = uploaded_form.read()
-    if name.endswith(".pdf"):
+    if uploaded_form.name.lower().endswith(".pdf"):
         st.session_state.aw_form_text, st.session_state.aw_form_images = extract_pdf_content(file_bytes)
     else:
-        st.session_state.aw_form_text = extract_hwp_text(file_bytes)
+        st.session_state.aw_form_text = _extract_uploaded_text(uploaded_form.name, file_bytes)
         st.session_state.aw_form_images = []
 
 if st.button("🔍 AI로 요건 분석하기", type="primary"):
@@ -301,8 +314,8 @@ if requirements:
         st.caption("⚠️ 선택된 기업 정보가 없습니다. 위에서 불러오거나, 아래 추가 자료에 회사 정보를 직접 입력해 주세요.")
 
     extra_files = st.file_uploader(
-        "추가 준비자료 (사업계획 초안, 실적자료 등, PDF/HWP/HWPX, 여러 개 가능)",
-        type=["pdf", "hwp", "hwpx"],
+        "추가 준비자료 (사업계획 초안, 실적자료 등, PDF/HWP/HWPX/Word, 여러 개 가능)",
+        type=["pdf", "hwp", "hwpx", "docx", "doc"],
         accept_multiple_files=True,
         key="aw_extra_uploader",
     )
@@ -315,12 +328,8 @@ if requirements:
     if st.button("✍️ AI로 초안 생성하기", type="primary", disabled=not requirements.get("form_sections")):
         extra_parts = [extra_text_input] if extra_text_input else []
         for f in extra_files or []:
-            fname = f.name.lower()
             fbytes = f.read()
-            if fname.endswith(".pdf"):
-                text, _ = extract_pdf_content(fbytes)
-            else:
-                text = extract_hwp_text(fbytes)
+            text = _extract_uploaded_text(f.name, fbytes)
             if text:
                 extra_parts.append(f"[{f.name}]\n{text}")
         st.session_state.aw_extra_context = "\n\n".join(extra_parts)
