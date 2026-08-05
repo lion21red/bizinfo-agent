@@ -34,8 +34,20 @@ MAX_ATTACHMENT_IMAGE_PAGES = 5
 PROMPT_TEMPLATE = """
 당신은 대한민국 정부 지원사업 전문가입니다. 아래 사업공고 텍스트(및 첨부된 공고문 이미지가 있다면 그 내용까지 함께)를 분석하여 지정된 JSON 형식으로 핵심 요건을 추출하세요. 공고에 명시되지 않은 항목은 추측하지 말고 null 또는 0으로 두세요.
 
+[공고 제목]
+{title}
+
+[소관기관]
+{department}
+
 [사업공고 본문]
 {content}
+
+[지역 제한(location_limit) 판단 시 특별 유의사항]
+본문에 지역 제한이 별도로 다시 적혀있지 않더라도, 아래 신호가 있으면 지역이 제한된 것으로 간주해서 location_limit에 반영하세요 (지자체가 예산을 지원하는 사업은 대개 그 지역 소재 기업만 신청 가능합니다).
+- 제목에 "[충북]", "[대전]"처럼 지역명이 대괄호로 붙어있으면 그 지역으로 제한
+- 소관기관이 특정 시/도/군/구 등 지자체(예: 충청북도, 대전광역시)이면 그 지역으로 제한
+- 소관기관이 중앙부처나 전국 단위 기관(예: 중소벤처기업부, 지식재산처)이면서 제목에도 지역 태그가 없으면 전국으로 간주
 
 [추출할 JSON 스키마]
 {{
@@ -97,9 +109,15 @@ class BillingExhaustedError(Exception):
     """Gemini API 선불 크레딧이 소진된 경우 - 재시도해도 소용없으므로 즉시 중단해야 함."""
 
 
-def parse_announcement(content: str, images: list | None = None) -> dict:
-    """Gemini API를 이용해 공고 텍스트(+첨부 이미지)를 구조화된 JSON으로 변환"""
-    prompt = PROMPT_TEMPLATE.format(content=content[:6000])
+def parse_announcement(content: str, images: list | None = None, title: str = "", department: str = "") -> dict:
+    """Gemini API를 이용해 공고 텍스트(+첨부 이미지)를 구조화된 JSON으로 변환.
+    title/department도 함께 넘겨서, 본문에 지역 제한이 명시적으로 반복되지 않은 경우에도
+    제목의 지역 태그나 지자체 소관기관명으로 지역 제한을 유추할 수 있게 한다."""
+    prompt = PROMPT_TEMPLATE.format(
+        title=title or "(제목 없음)",
+        department=department or "(소관기관 미상)",
+        content=content[:6000],
+    )
     target_model = "gemini-flash-lite-latest"
 
     try:
@@ -191,7 +209,7 @@ def process_unparsed_announcements(batch_size: int = 20):
                     if attachment_text:
                         content = f"{content}\n\n[첨부 공고문 원문]\n{attachment_text}"
 
-                parsed_result = parse_announcement(content, images)
+                parsed_result = parse_announcement(content, images, title=title, department=item.get("department", ""))
 
                 if parsed_result:
                     target_summary = parsed_result.get("target_summary", "")
