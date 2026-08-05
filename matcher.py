@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 from datetime import date, datetime
 from dotenv import load_dotenv
@@ -207,7 +208,26 @@ def fetch_matchable_announcements():
             break
         start += page_size
 
-    return all_records
+    return _dedupe_reposted(all_records)
+
+
+def _dedupe_reposted(records: list) -> list:
+    """기업마당은 같은 공고를 재공고 등으로 다른 origin_id로 다시 올리는 경우가 있어(제목·
+    소관기관까지 동일), 그대로 두면 매칭 결과에 완전히 똑같은 카드가 중복으로 뜬다. 제목+
+    소관기관이 같으면 origin_id 끝자리 숫자가 더 큰(= 기업마당에 더 나중에 등록된) 것만
+    남긴다."""
+    def origin_seq(r):
+        m = re.search(r"(\d+)$", r.get("origin_id") or "")
+        return int(m.group(1)) if m else 0
+
+    latest_by_key = {}
+    for r in records:
+        title = r.get("title")
+        # 제목이 비어있는 비정상 레코드는 묶어서 서로 지워버리지 않도록 항상 고유 키로 취급한다.
+        key = (title, r.get("department")) if title else (id(r),)
+        if key not in latest_by_key or origin_seq(r) > origin_seq(latest_by_key[key]):
+            latest_by_key[key] = r
+    return list(latest_by_key.values())
 
 
 def run_matching():
