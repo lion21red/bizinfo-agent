@@ -70,6 +70,25 @@ def _as_number(value):
         return None
 
 
+def _region_matches(company_region: str, location_limit: list) -> bool:
+    """공고의 location_limit(대개 '서울', '경기'처럼 시/도 단위)과 기업의 region(이 앱
+    자체 추출 프롬프트가 '가능하면 시/군/구까지 상세히' 쓰도록 유도해 '서울 광진구'처럼
+    시/군/구까지 붙는 경우가 흔함)은 표기 단위가 서로 달라서, 예전처럼 완전히 같은
+    문자열인지(in)만 비교하면 실제로는 지역이 맞는데도 계속 '지역 불일치'로 걸러졌다
+    (예: company_region='서울 광진구', location_limit=['서울'] -> 이전 로직은 불일치 처리).
+    한쪽이 다른 쪽의 접두어면 같은 지역으로 본다."""
+    if not location_limit or "전국" in location_limit:
+        return True
+    if not company_region:
+        return False
+    company_region = company_region.strip()
+    for loc in location_limit:
+        loc = (loc or "").strip()
+        if loc and (company_region == loc or company_region.startswith(loc) or loc.startswith(company_region)):
+            return True
+    return False
+
+
 def match_announcement(company: dict, parsed: dict) -> dict:
     """기업 프로필과 파싱된 공고 조건을 비교해 적합도를 산출"""
     # 예비창업자 여부가 명시적으로 확인된 경우에만 업력 0으로 취급한다.
@@ -94,7 +113,7 @@ def match_announcement(company: dict, parsed: dict) -> dict:
             pass
 
     location_limit = parsed.get("location_limit") or []
-    if location_limit and "전국" not in location_limit and company["region"] not in location_limit:
+    if not _region_matches(company.get("region"), location_limit):
         return {"is_eligible": False, "score": 0, "reason": f"지역 불일치 (지원 가능: {', '.join(location_limit)})"}
 
     company_revenue = _as_number(company.get("annual_revenue"))
