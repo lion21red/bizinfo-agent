@@ -173,6 +173,16 @@ def match_announcement(company: dict, parsed: dict) -> dict:
             "reason": f"업종 불일치 (지원 가능: {ksic.section_names(industry_sections)})",
         }
 
+    excluded_sections = parsed.get("excluded_industry_sections") or []
+    if company_section and company_section in excluded_sections:
+        return {"is_eligible": False, "score": 0, "reason": f"제외 업종 ({ksic.section_names([company_section])})"}
+
+    applicant_stage = parsed.get("applicant_stage")
+    if applicant_stage == "예비창업자" and not company.get("is_pre_founder"):
+        return {"is_eligible": False, "score": 0, "reason": "예비창업자 전용 공고 (사업자등록 전만 신청 가능)"}
+    if applicant_stage == "기존사업자" and company.get("is_pre_founder"):
+        return {"is_eligible": False, "score": 0, "reason": "사업자등록을 마친 기업만 신청 가능"}
+
     # 기본 자격 충족 -> 가점 계산 (기본점수를 낮추고 가점 항목을 늘려 우선순위 변별력을 높임)
     score = 50
     bonus_reasons = []

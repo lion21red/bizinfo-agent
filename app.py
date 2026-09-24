@@ -564,7 +564,8 @@ if st.session_state.profile:
                             st.markdown(f"- {t}")
 
                     if parsed.get("ineligible_targets"):
-                        st.markdown("**신청 제외 대상**")
+                        st.markdown("**신청 제외 대상 — 신청 전 해당 여부 확인 필요**")
+                        st.caption("업종 제외와 예비창업자/기존사업자 구분은 매칭에 자동 반영했습니다. 체납·휴폐업·참여제한·중복수혜 등은 기업 정보만으로 판단할 수 없어 직접 확인이 필요합니다.")
                         for t in parsed["ineligible_targets"]:
                             st.markdown(f"- {t}")
 

@@ -59,6 +59,8 @@ PROMPT_TEMPLATE = """
 
 {industry_guide}
 
+{exclusion_guide}
+
 [추출할 JSON 스키마]
 {{
   "target_summary": "신청 대상 요약 (예: 서울 소재 3년 이내 IT 창업기업)",
@@ -81,6 +83,8 @@ PROMPT_TEMPLATE = """
   "requires_female_owned": "여성기업(여성기업 확인서 보유 등)만 신청 가능한 필수 자격요건인지 여부 (true/false). 단순 가점/우대 사항이면 false",
   "eligible_targets": ["신청자격 요건 리스트"],
   "ineligible_targets": ["신청제외 대상 리스트"],
+  "excluded_industry_sections": ["제외 대상으로 명시된 업종의 KSIC 대분류 코드 목록 (위 제외 업종 판단 기준에 따라) / 없으면 빈 배열"],
+  "applicant_stage": "예비창업자 / 기존사업자 / 무관 중 하나 (위 신청 단계 판단 기준에 따라)",
   "support_details": ["주요 지원 내용 요약"]
 }}
 """
@@ -146,6 +150,7 @@ def parse_announcement(content: str, images: list | None = None, title: str = ""
         department=department or "(소관기관 미상)",
         content=content[:MAX_PROMPT_CONTENT_CHARS],
         industry_guide=ksic.ANNOUNCEMENT_SECTION_GUIDE,
+        exclusion_guide=ksic.EXCLUSION_GUIDE,
     )
     target_model = "gemini-flash-lite-latest"
 
@@ -244,6 +249,12 @@ def process_unparsed_announcements(batch_size: int = 20):
                     # 모델이 "제조업"처럼 이름을 적거나 없는 코드를 내는 경우를 걸러, 매칭 필터가
                     # 신뢰할 수 있는 유효 대분류 코드만 남긴다.
                     parsed_result["industry_sections"] = ksic.valid_sections(parsed_result.get("industry_sections"))
+                    parsed_result["excluded_industry_sections"] = ksic.valid_excluded_sections(
+                        parsed_result.get("excluded_industry_sections"), parsed_result.get("ineligible_targets")
+                    )
+                    parsed_result["applicant_stage"] = ksic.valid_stage(
+                        parsed_result.get("applicant_stage"), ksic.stage_evidence_texts(parsed_result, title)
+                    )
                     target_summary = parsed_result.get("target_summary", "")
                     max_grant = parsed_result.get("max_grant_amount", 0)
                     end_date = parsed_result.get("end_date")

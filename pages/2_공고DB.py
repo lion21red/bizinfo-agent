@@ -202,7 +202,7 @@ for r in rows:
                         st.markdown(f"- {t}")
 
                 if parsed.get("ineligible_targets"):
-                    st.markdown("**신청 제외 대상**")
+                    st.markdown("**신청 제외 대상 — 신청 전 해당 여부 확인 필요**")
                     for t in parsed["ineligible_targets"]:
                         st.markdown(f"- {t}")
 

@@ -7,6 +7,7 @@
 
 import json
 import os
+import re
 
 from dotenv import load_dotenv
 from google import genai
@@ -145,3 +146,122 @@ def classify_announcement_industries(items: list[dict]) -> dict[str, list[str]]:
         for num, codes in parsed.items()
         if num in numbered and isinstance(codes, list)
     }
+
+
+APPLICANT_STAGES = ("예비창업자", "기존사업자", "무관")
+
+# 제외대상 대부분(국세 체납, 휴·폐업, 참여제한 등)은 기업 프로필로 판단할 수 없는 상태 조건이라
+# 신청 전 확인 항목으로 남기고, 프로필로 판단 가능한 두 가지만 구조화한다.
+EXCLUSION_GUIDE = f"""[KSIC 대분류]
+{_SECTION_LIST_TEXT}
+
+[제외 업종(excluded_industry_sections) 판단 기준]
+- 제외 대상이 업종을 이름으로 명시할 때만 해당 대분류 코드를 넣으세요 (예: "도소매업, 유통업 제외" -> G, "금융·보험·부동산업 제외" -> K, L, "유흥주점업 제외" -> I).
+- "제외업종에 해당하는 사업자", "신용보증 제외 업종"처럼 구체적 업종 이름 없이 별도 목록을 가리키는 표현은 넣지 마세요.
+- 대분류 일부만 제외하는 경우는 넣지 마세요 (예: 유흥주점업은 음식점업 I의 일부, 인쇄업은 제조업 C의 일부 -> I, C를 넣지 않음). 대분류 전체 또는 대부분이 제외될 때만 넣으세요 — 잘못 넣으면 신청 가능한 기업이 매칭에서 누락됩니다.
+- "단순 서비스업", "기타 서비스업"처럼 범위가 모호한 표현은 넣지 마세요.
+- "유흥·향락업", "유흥주점", "사행성 업종", "금융기관 불량거래자"는 업종 대분류 제외가 아닙니다 (각각 음식점업의 일부, 도박, 신용 상태) -> 넣지 마세요.
+- 예: "단순 서비스업 및 도소매업, 무역업, 유통업, 인쇄업 등" -> ["G"] (도소매·무역·유통만 대분류 G에 해당하고, 나머지는 모호하거나 일부)
+
+[신청 단계(applicant_stage) 판단 기준]
+- "예비창업자": 사업자등록을 하지 않은 사람만 신청 가능 (예: 제외 대상에 "사업자등록한 자")
+- "기존사업자": 사업자등록을 마친 기업·사업자만 신청 가능하고 예비창업자는 신청 불가
+- "무관": 둘 다 신청 가능하거나, 공고만으로 판단하기 어려운 경우"""
+
+
+# 명시적 업종 제외는 실제로 1~3개 대분류에 그친다. 그보다 많으면 모델이 "단순 서비스업" 같은
+# 모호한 표현을 여러 대분류로 부풀린 것이라, 신청 가능한 기업을 대량으로 떨어뜨리지 않도록 버린다.
+MAX_EXCLUDED_SECTIONS = 3
+
+
+# 모델이 제안한 제외 업종은, 제외 문구에 그 대분류 전체를 가리키는 표현이 실제로 있을 때만 인정한다.
+# 경량 모델이 "유흥주점업 제외"를 음식점업(I) 전체 제외로, "금융기관 불량거래자"를 금융업(K) 제외로
+# 부풀리는 일이 잦았는데, 그대로 두면 음식점·카페처럼 흔한 소상공인이 통째로 매칭에서 빠진다.
+# 근거 패턴이 없는 대분류는 명시적 전체 제외 사례가 드물어 인정하지 않는다(보수적).
+_EXCLUSION_EVIDENCE = {
+    "F": re.compile(r"건설업"),
+    "G": re.compile(r"도매|소매|도[·ㆍ]\s*소매|유통업|단순\s*유통|무역업|무역\s*상사|수출\s*대행"),
+    "H": re.compile(r"운수업|운수\s*및\s*창고업|(?<![가-힣])운송업|(?<![가-힣])창고업"),
+    "I": re.compile(r"음식점(?!업?\s*중)|숙박업|숙박\s*[·ㆍ,]"),
+    "K": re.compile(r"금융\s*[·ㆍ,]?\s*보험|금융업|보험업"),
+    "L": re.compile(r"부동산업(?!\s*일부)|부동산\s*임대|임대업"),
+}
+
+
+def valid_excluded_sections(codes, ineligible_texts) -> list[str]:
+    codes = valid_sections(codes)
+    if len(codes) > MAX_EXCLUDED_SECTIONS:
+        return []
+    text = " ".join(ineligible_texts or [])
+    return [c for c in codes if c in _EXCLUSION_EVIDENCE and _EXCLUSION_EVIDENCE[c].search(text)]
+
+
+# "예비창업자 전용"은 사업자등록을 마친 모든 기업을 매칭에서 빼므로, 공고 문구에 예비창업자나
+# 사업자등록 전 요건이 실제로 있을 때만 인정한다. 모델이 "창업 7년 이내 창업기업"처럼 창업이라는
+# 말만 보고 예비창업자 전용으로 오판하는 경우가 있었다.
+_PRE_FOUNDER_EVIDENCE = re.compile(
+    r"예비\s*(청년\s*|중장년\s*|재)?창업|창업\s*예정|사업자\s*등록\s*(을\s*)?(하지\s*않|예정|전)"
+    r"|사업자\s*등록\s*(이력이|이)?\s*없|사업자\s*등록\S*\s*(이\s*)?있는\s*자|사업자\s*등록을?\s*한\s*자"
+)
+
+
+def valid_stage(stage, texts=None) -> str:
+    if stage not in APPLICANT_STAGES:
+        return "무관"
+    if stage == "예비창업자" and texts is not None and not _PRE_FOUNDER_EVIDENCE.search(" ".join(t for t in texts if t)):
+        return "무관"
+    return stage
+
+
+def stage_evidence_texts(parsed: dict, title: str = "") -> list[str]:
+    return [title or "", parsed.get("target_summary") or ""] + (parsed.get("eligible_targets") or []) + (parsed.get("ineligible_targets") or [])
+
+
+def classify_announcement_exclusions(items: list[dict]) -> dict[str, dict]:
+    """공고 여러 건의 제외 업종과 신청 단계를 한 번의 호출로 판단한다.
+
+    items: [{"id", "title", "target_summary", "eligible_targets", "ineligible_targets"}]
+    반환: {id: {"excluded_industry_sections": [...], "applicant_stage": "..."}}
+    응답에서 빠진 공고는 결과에 포함하지 않는다 (다음 실행 때 재시도).
+    """
+    numbered = {}
+    texts_by_id = {item["id"]: item.get("ineligible_targets") or [] for item in items}
+    stage_texts_by_id = {item["id"]: stage_evidence_texts(item, item.get("title")) for item in items}
+    payload = []
+    for i, item in enumerate(items, start=1):
+        numbered[str(i)] = item["id"]
+        payload.append({
+            "번호": str(i),
+            "제목": item.get("title") or "",
+            "대상요약": (item.get("target_summary") or "")[:300],
+            "신청자격": [t[:150] for t in (item.get("eligible_targets") or [])[:5]],
+            "제외대상": [t[:150] for t in (item.get("ineligible_targets") or [])[:10]],
+        })
+
+    prompt = f"""당신은 정부 지원사업 신청 자격 검토 전문가입니다. 아래 공고 각각에 대해 제외 업종과 신청 단계를 판단하세요.
+
+{EXCLUSION_GUIDE}
+
+[공고 목록]
+{json.dumps(payload, ensure_ascii=False)}
+
+[출력]
+반드시 JSON 객체로만 답하세요: {{"번호": {{"excluded_industry_sections": ["코드", ...], "applicant_stage": "예비창업자|기존사업자|무관"}}, ...}}
+모든 번호를 빠짐없이 포함하세요."""
+
+    response = _get_client().models.generate_content(
+        model=MODEL, contents=prompt, config={"response_mime_type": "application/json"}
+    )
+    parsed = json.loads(response.text.strip())
+    if not isinstance(parsed, dict):
+        return {}
+    result = {}
+    for num, value in parsed.items():
+        if num in numbered and isinstance(value, dict):
+            result[numbered[num]] = {
+                "excluded_industry_sections": valid_excluded_sections(
+                    value.get("excluded_industry_sections"), texts_by_id[numbered[num]]
+                ),
+                "applicant_stage": valid_stage(value.get("applicant_stage"), stage_texts_by_id[numbered[num]]),
+            }
+    return result
