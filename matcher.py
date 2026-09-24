@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import sys
 from datetime import date, datetime
 from dotenv import load_dotenv
@@ -216,6 +217,18 @@ def match_announcement(company: dict, parsed: dict) -> dict:
     return {"is_eligible": True, "score": score, "reason": ", ".join(bonus_reasons) if bonus_reasons else "기본 자격 충족"}
 
 
+def _fetch_page_with_retry(run_query, attempts: int = 3) -> list:
+    """일시적인 DB 시간 초과(statement timeout)만 잠깐 쉬었다가 다시 시도한다."""
+    for attempt in range(attempts):
+        try:
+            return run_query().data
+        except Exception as e:
+            if "statement timeout" not in str(e) or attempt == attempts - 1:
+                raise
+            time.sleep(1 + attempt)
+    return []
+
+
 def fetch_matchable_announcements():
     """매칭 대상 공고를 조회한다. 마감일이 지난 공고나(end_date 기준), 기업마당 API
     목록에서 이미 사라진 공고(is_active=False, collector.py가 매일 감지)는 매칭에서
@@ -223,15 +236,17 @@ def fetch_matchable_announcements():
     archived_announcements로 옮겨진다 - collector.py의 archive_old_closed_announcements 참고).
 
     PostgREST는 기본적으로 응답을 1000건으로 제한하므로, 공고 수가 그 이상으로
-    늘어나도 전부 가져오도록 range()로 페이지를 나눠 조회한다."""
+    늘어나도 전부 가져오도록 range()로 페이지를 나눠 조회한다. 페이지를 500건으로 두는
+    이유: Supabase는 anon 키 쿼리에 약 3초 제한을 두는데, 본문·파싱결과가 큰 1000건
+    페이지는 평소 1초 안팎이지만 DB가 바쁘면 그 제한을 넘겨 매칭이 통째로 실패했다."""
     today_str = date.today().isoformat()
-    page_size = 1000
+    page_size = 500
     all_records = []
     start = 0
 
     while True:
-        response = (
-            supabase.table("announcements")
+        page = _fetch_page_with_retry(
+            lambda: supabase.table("announcements")
             .select("*")
             .not_.is_("parsed_data", "null")
             .eq("is_active", True)
@@ -239,7 +254,6 @@ def fetch_matchable_announcements():
             .range(start, start + page_size - 1)
             .execute()
         )
-        page = response.data
         all_records.extend(page)
         if len(page) < page_size:
             break
