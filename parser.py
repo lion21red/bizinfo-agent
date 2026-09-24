@@ -11,6 +11,7 @@ from google import genai
 from pdf_utils import extract_pdf_content
 from hwp_utils import extract_hwp_text
 from docx_utils import extract_docx_text, extract_doc_text
+import ksic
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -56,6 +57,8 @@ PROMPT_TEMPLATE = """
 - 소관기관이 특정 시/도/군/구 등 지자체(예: 충청북도, 대전광역시)이면 그 지역으로 제한
 - 소관기관이 중앙부처나 전국 단위 기관(예: 중소벤처기업부, 지식재산처)이면서 제목에도 지역 태그가 없으면 전국으로 간주
 
+{industry_guide}
+
 [추출할 JSON 스키마]
 {{
   "target_summary": "신청 대상 요약 (예: 서울 소재 3년 이내 IT 창업기업)",
@@ -68,6 +71,7 @@ PROMPT_TEMPLATE = """
   "max_revenue": "최대 매출액 제한 (원 단위 숫자, 제한없으면 null)",
   "max_employees": "최대 상시근로자 수 제한 (숫자, 제한없으면 null)",
   "industry_limit": ["지원 가능한 업종 목록 (예: 제조업, 정보통신업 등) / 제한없으면 빈 배열"],
+  "industry_sections": ["신청 가능한 업종의 KSIC 대분류 코드 목록 (위 판단 기준에 따라, 예: ['C', 'G']) / 업종 제한이 없으면 빈 배열"],
   "min_ceo_age": "대표자 최소 나이 제한 (숫자만, 제한없으면 null)",
   "max_ceo_age": "대표자 최대 나이 제한 (숫자만, 예: 청년창업 만 39세 이하 -> 39, 제한없으면 null)",
   "org_type_limit": ["신청 가능한 조직형태 목록 (예: 사회적기업, 협동조합, 마을기업 등) / 특정 조직형태로 제한하지 않으면 빈 배열"],
@@ -141,6 +145,7 @@ def parse_announcement(content: str, images: list | None = None, title: str = ""
         title=title or "(제목 없음)",
         department=department or "(소관기관 미상)",
         content=content[:MAX_PROMPT_CONTENT_CHARS],
+        industry_guide=ksic.ANNOUNCEMENT_SECTION_GUIDE,
     )
     target_model = "gemini-flash-lite-latest"
 
@@ -236,6 +241,9 @@ def process_unparsed_announcements(batch_size: int = 20):
                 parsed_result = parse_announcement(content, images, title=title, department=item.get("department", ""))
 
                 if parsed_result:
+                    # 모델이 "제조업"처럼 이름을 적거나 없는 코드를 내는 경우를 걸러, 매칭 필터가
+                    # 신뢰할 수 있는 유효 대분류 코드만 남긴다.
+                    parsed_result["industry_sections"] = ksic.valid_sections(parsed_result.get("industry_sections"))
                     target_summary = parsed_result.get("target_summary", "")
                     max_grant = parsed_result.get("max_grant_amount", 0)
                     end_date = parsed_result.get("end_date")

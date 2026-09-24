@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
+import ksic
 import matcher
 from pdf_utils import extract_pdf_content
 from ui_helpers import render_field, render_field_grid
@@ -15,6 +16,8 @@ load_dotenv(override=True)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
+
+AUTO_SECTION_LABEL = "자동 분류 (업종 텍스트로 판단)"
 
 PROFILE_PROMPT_TEMPLATE = """
 당신은 대한민국 정부 지원사업 신청 자격을 검토하는 경영지도사입니다. 아래 기업 관련 문서(사업자등록증, 회사소개서, 재무자료 등) 텍스트에서 핵심 정보를 추출하여 지정된 JSON 형식으로 반환하세요. 문서에 명시되지 않은 항목은 합리적으로 추정하지 말고 null 또는 0으로 두세요.
@@ -157,6 +160,7 @@ def save_company(profile: dict):
         "certifications": profile.get("certifications") or "",
         "is_pre_founder": profile.get("is_pre_founder", False),
         "detail_notes": profile.get("detail_notes") or "",
+        "industry_section": profile.get("industry_section") or None,
     }
     # company_name 기준 upsert: 같은 회사를 다시 저장하면 새 행을 만들지 않고 기존 값을 덮어쓴다.
     # (companies.company_name에 UNIQUE 제약이 있어야 동작함 - sql/dedupe_companies.sql 참고)
@@ -222,6 +226,7 @@ with st.expander("💾 저장된 기업 불러오기"):
                 "certifications": c.get("certifications"),
                 "is_pre_founder": c.get("is_pre_founder"),
                 "detail_notes": c.get("detail_notes"),
+                "industry_section": c.get("industry_section"),
             }
     else:
         st.caption("아직 저장된 기업이 없습니다.")
@@ -348,6 +353,14 @@ if st.session_state.profile:
         )
         region = st.text_input("소재 지역 (시/군/구까지)", p.get("region") or "")
         industry = st.text_input("업종", p.get("industry") or "")
+        section_options = [AUTO_SECTION_LABEL] + [f"{code}: {name}" for code, name in ksic.KSIC_SECTIONS.items()]
+        section_codes = [None] + list(ksic.KSIC_SECTIONS.keys())
+        section_label = st.selectbox(
+            "업종 대분류 (KSIC) — 공고 업종 제한과 비교하는 기준",
+            section_options,
+            index=section_codes.index(p.get("industry_section")) if p.get("industry_section") in section_codes else 0,
+        )
+        industry_section = section_codes[section_options.index(section_label)]
         business_entity_type = st.selectbox(
             "기업 형태", ["법인", "개인사업자"],
             index=(0 if p.get("business_entity_type") != "개인사업자" else 1),
@@ -398,6 +411,7 @@ if st.session_state.profile:
         "certifications": certifications,
         "is_pre_founder": is_pre_founder,
         "detail_notes": detail_notes,
+        "industry_section": industry_section,
     }
 
     btn_col1, btn_col2 = st.columns(2)
@@ -405,6 +419,13 @@ if st.session_state.profile:
         save_clicked = st.button("💾 이 기업 정보 저장하기")
     with btn_col2:
         match_clicked = st.button("✅ 이 정보로 지원사업 매칭하기", type="primary")
+
+    if save_clicked or match_clicked:
+        # 대분류를 비워 두면(자동 분류) 업종 텍스트로 한 번 분류해서 채운다. 다음 화면 갱신 때
+        # 선택 상자에도 반영되어 컨설턴트가 결과를 보고 바로 고칠 수 있다.
+        if not confirmed_profile["industry_section"] and industry:
+            confirmed_profile["industry_section"] = ksic.classify_company_industry(industry, detail_notes)
+            st.session_state.profile["industry_section"] = confirmed_profile["industry_section"]
 
     if save_clicked:
         try:

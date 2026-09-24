@@ -5,6 +5,8 @@ from datetime import date, datetime
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
+import ksic
+
 sys.stdout.reconfigure(encoding="utf-8")
 
 load_dotenv(override=True)
@@ -159,6 +161,17 @@ def match_announcement(company: dict, parsed: dict) -> dict:
     if parsed.get("requires_female_owned") and not company.get("is_female_owned"):
         return {"is_eligible": False, "score": 0, "reason": "여성기업 확인서 보유 기업만 신청 가능"}
 
+    # 업종은 KSIC 대분류 코드로 정규화된 값끼리만 비교한다. industry_sections 키가 아예 없는
+    # 공고(아직 정규화 전)나 기업 대분류를 모르는 경우엔 걸러내지 않는다.
+    industry_sections = parsed.get("industry_sections")
+    company_section = company.get("industry_section")
+    if industry_sections and company_section and company_section not in industry_sections:
+        return {
+            "is_eligible": False,
+            "score": 0,
+            "reason": f"업종 불일치 (지원 가능: {ksic.section_names(industry_sections)})",
+        }
+
     # 기본 자격 충족 -> 가점 계산 (기본점수를 낮추고 가점 항목을 늘려 우선순위 변별력을 높임)
     score = 50
     bonus_reasons = []
@@ -180,14 +193,19 @@ def match_announcement(company: dict, parsed: dict) -> dict:
         score += 8
         bonus_reasons.append("특허보유 가점")
 
-    # 업종/인증 일치는 표현 방식이 다양해(예: "제조업" vs "육류 가공식품 도매업") 오탐 위험이 커서
-    # 강한 필터링 대신 명확히 겹치는 경우에만 가점을 주는 참고 신호로만 사용한다.
-    industry_limit = parsed.get("industry_limit") or []
-    company_industry = (company.get("industry") or "").strip()
-    if industry_limit and company_industry:
-        if any(ind in company_industry or company_industry in ind for ind in industry_limit):
+    # 업종을 특정해서 모집하는 공고는 그 업종 기업에게 더 맞춤형이므로 가점을 준다.
+    # 대분류 정규화 전 공고는 예전처럼 업종 표현이 명확히 겹칠 때만 가점을 준다.
+    if industry_sections is not None:
+        if industry_sections and company_section in industry_sections:
             score += 8
-            bonus_reasons.append("업종 일치 가점")
+            bonus_reasons.append("업종 특화 공고")
+    else:
+        industry_limit = parsed.get("industry_limit") or []
+        company_industry = (company.get("industry") or "").strip()
+        if industry_limit and company_industry:
+            if any(ind in company_industry or company_industry in ind for ind in industry_limit):
+                score += 8
+                bonus_reasons.append("업종 일치 가점")
 
     company_certs = [c.strip() for c in (company.get("certifications") or "").split(",") if c.strip()]
     if company_certs and any(cert in eligible_text for cert in company_certs):
