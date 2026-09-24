@@ -13,6 +13,7 @@ from hwp_utils import extract_hwp_text
 from docx_utils import extract_docx_text, extract_doc_text
 import ksic
 import needs
+import relevance
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -279,6 +280,11 @@ def process_unparsed_announcements(batch_size: int = 20):
                         "max_grant": max_grant,
                         "end_date": end_date
                     }
+                    try:
+                        update_data["embedding"] = relevance.announcement_embedding(title, parsed_result)
+                    except Exception as e:
+                        # 임베딩이 없어도 매칭 때 다시 계산하므로 파싱 결과 저장은 그대로 진행한다.
+                        print(f"  └ ⚠️ 임베딩 생성 실패 (매칭 때 다시 계산): {e}")
 
                     supabase.table("announcements").update(update_data).eq("id", ann_id).execute()
                     print(f"  └ ✅ 파싱 및 DB 업데이트 완료!")

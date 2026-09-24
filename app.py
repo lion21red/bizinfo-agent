@@ -10,6 +10,7 @@ from google.genai import types
 import ksic
 import matcher
 import needs
+import relevance
 from pdf_utils import extract_pdf_content
 from ui_helpers import render_field, render_field_grid
 
@@ -498,6 +499,7 @@ if st.session_state.profile:
                 r = matcher.match_announcement(confirmed_profile, parsed, item.get("title", ""))
                 results.append(
                     {
+                        "id": item.get("id"),
                         "title": item.get("title", ""),
                         "department": item.get("department"),
                         "category": item.get("category"),
@@ -516,6 +518,12 @@ if st.session_state.profile:
             eligible = sorted(
                 [r for r in results if r["is_eligible"]], key=lambda r: r["score"], reverse=True
             )
+
+        with st.spinner("AI가 공고별로 이 기업과의 관련도를 평가하는 중..."):
+            try:
+                eligible = relevance.apply(confirmed_profile, eligible)
+            except Exception as e:
+                st.warning(f"관련도 평가에 실패해 기본 점수로 정렬합니다 ({e})")
 
         st.session_state.match_eligible = eligible
         st.session_state.match_total = len(results)
@@ -577,6 +585,10 @@ if st.session_state.profile:
         for i, r in enumerate(page_items):
                 is_pdf = (r.get("attachment_filename") or "").lower().endswith(".pdf")
                 badge = " 📄PDF 심층분석" if is_pdf else ""
+                if r.get("relevance") is not None and r["relevance"] >= 8:
+                    badge += " 🎯맞춤"
+                elif r.get("relevance") is not None and r["relevance"] <= 3:
+                    badge += " ⚠️관련도 낮음"
                 header = f"[{r['score']}점] {r['title']}{badge}"
                 support_types = (r.get("parsed_data") or {}).get("support_types")
                 field_text = "/".join(support_types) if support_types else (r.get("category") or "분야 미상")
@@ -585,6 +597,8 @@ if st.session_state.profile:
                     parsed = r.get("parsed_data") or {}
 
                     render_field("매칭 점수 사유", r["reason"])
+                    if r.get("relevance") is not None:
+                        render_field("AI 관련도", f"{r['relevance']}/10 — {r.get('relevance_reason') or ''}")
 
                     if parsed.get("target_summary"):
                         render_field("대상 요약", parsed["target_summary"])
