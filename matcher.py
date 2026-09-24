@@ -93,6 +93,13 @@ def _region_matches(company_region: str, location_limit: list) -> bool:
     return False
 
 
+# 적합도 점수 구성 (합계 100). 필요사항을 입력하지 않은 기업은 'needs'를 빼고 나머지 합으로 환산한다.
+# 우대 조건을 명시한 공고가 드물어(약 5%) 우대 비중이 크면 잘 맞는 공고도 점수가 낮게 나오므로,
+# 이 기업에 실제로 쓸모 있는지(관련도·필요 일치)에 비중을 둔다.
+SCORE_WEIGHTS = {"relevance": 50, "needs": 30, "preference": 10, "certainty": 10}
+SCORE_LABELS = {"relevance": "관련도", "needs": "필요 일치", "preference": "우대", "certainty": "자격 확인"}
+
+
 def match_announcement(company: dict, parsed: dict, title: str = "") -> dict:
     """기업 프로필과 파싱된 공고 조건을 비교해 적합도를 산출"""
     # 예비창업자 여부가 명시적으로 확인된 경우에만 업력 0으로 취급한다.
@@ -123,7 +130,10 @@ def match_announcement(company: dict, parsed: dict, title: str = "") -> dict:
     company_revenue = _as_number(company.get("annual_revenue"))
     min_revenue = _as_number(parsed.get("min_revenue"))
     max_revenue = _as_number(parsed.get("max_revenue"))
-    if company_revenue is not None:
+    # 화면·서류 추출에서 매출을 모르면 0으로 들어오므로, 예비창업자가 아닌 한 0은 '알 수 없음'으로 보고
+    # 걸러내지 않는다 (아래 자격 확인 점수에서 확인 필요 항목으로 표시).
+    revenue_known = company_revenue is not None and (company_revenue > 0 or company.get("is_pre_founder"))
+    if revenue_known:
         if min_revenue is not None and company_revenue < min_revenue:
             return {"is_eligible": False, "score": 0, "reason": f"매출액 미달 (최소 {min_revenue:,.0f}원 필요)"}
         if max_revenue is not None and company_revenue > max_revenue:
@@ -184,64 +194,111 @@ def match_announcement(company: dict, parsed: dict, title: str = "") -> dict:
     if applicant_stage == "기존사업자" and company.get("is_pre_founder"):
         return {"is_eligible": False, "score": 0, "reason": "사업자등록을 마친 기업만 신청 가능"}
 
-    # 기본 자격 충족 -> 가점 계산 (기본점수를 낮추고 가점 항목을 늘려 우선순위 변별력을 높임)
-    score = 50
-    bonus_reasons = []
+    # ---- 적합도 점수 (100점 만점, 구성 요소별 점수는 SCORE_WEIGHTS 참고) ----
+    # 관련도(relevance)는 여기서 계산하지 않고 relevance.apply()가 채운다.
     eligible_text = " ".join(parsed.get("eligible_targets") or []) + " " + (parsed.get("target_summary") or "")
+    reasons = []
 
-    if company.get("is_venture") and "벤처" in eligible_text:
-        score += 10
-        bonus_reasons.append("벤처기업 가점")
-    if company.get("is_female_owned") and "여성" in eligible_text:
-        score += 10
-        bonus_reasons.append("여성기업 가점")
-    if company.get("is_disabled_owned") and "장애인" in eligible_text:
-        score += 10
-        bonus_reasons.append("장애인기업 가점")
-    if company.get("is_reentrepreneur") and ("재창업" in eligible_text or "재도전" in eligible_text):
-        score += 10
-        bonus_reasons.append("재창업기업 가점")
-    if company.get("patent_count", 0) > 0 and ("특허" in eligible_text or "지식재산" in eligible_text):
-        score += 8
-        bonus_reasons.append("특허보유 가점")
+    # 필요 일치: 기업이 서술한 필요사항과 공고의 지원 유형·내용이 겹치는 정도
+    needs_points = 0
+    matched_types = [t for t in (company.get("need_types") or []) if t in (parsed.get("support_types") or [])]
+    if matched_types:
+        needs_points += 24
+        reasons.append(f"필요 분야 일치 ({', '.join(matched_types)})")
+    matched_keywords = needs.keyword_hits(company.get("need_keywords"), parsed, title)
+    if matched_keywords:
+        needs_points += 6 * len(matched_keywords)  # 합계는 아래에서 필요 일치 만점으로 자른다
+        reasons.append(f"관심 키워드 ({', '.join(matched_keywords[:3])})")
 
-    # 업종을 특정해서 모집하는 공고는 그 업종 기업에게 더 맞춤형이므로 가점을 준다.
-    # 대분류 정규화 전 공고는 예전처럼 업종 표현이 명확히 겹칠 때만 가점을 준다.
+    # 우대: 공고가 우대·가점으로 언급하는 기업 특성을 이 기업이 갖췄는지
+    preference_points = 0
+    for flag, words, points, label in (
+        ("is_venture", ("벤처",), 10, "벤처기업 우대"),
+        ("is_female_owned", ("여성",), 10, "여성기업 우대"),
+        ("is_disabled_owned", ("장애인",), 10, "장애인기업 우대"),
+        ("is_reentrepreneur", ("재창업", "재도전"), 10, "재창업기업 우대"),
+    ):
+        if company.get(flag) and any(w in eligible_text for w in words):
+            preference_points += points
+            reasons.append(label)
+    if (_as_number(company.get("patent_count")) or 0) > 0 and ("특허" in eligible_text or "지식재산" in eligible_text):
+        preference_points += 8
+        reasons.append("특허 보유 우대")
+    # 업종을 특정해서 모집하는 공고는 그 업종 기업에게 더 맞춤형이다. 대분류 정규화 전 공고는
+    # 예전처럼 업종 표현이 명확히 겹칠 때만 인정한다.
     if industry_sections is not None:
         if industry_sections and company_section in industry_sections:
-            score += 8
-            bonus_reasons.append("업종 특화 공고")
+            preference_points += 8
+            reasons.append("업종 특화 공고")
     else:
         industry_limit = parsed.get("industry_limit") or []
         company_industry = (company.get("industry") or "").strip()
-        if industry_limit and company_industry:
-            if any(ind in company_industry or company_industry in ind for ind in industry_limit):
-                score += 8
-                bonus_reasons.append("업종 일치 가점")
-
+        if industry_limit and company_industry and any(
+            ind in company_industry or company_industry in ind for ind in industry_limit
+        ):
+            preference_points += 8
+            reasons.append("업종 일치")
     company_certs = [c.strip() for c in (company.get("certifications") or "").split(",") if c.strip()]
     if company_certs and any(cert in eligible_text for cert in company_certs):
-        score += 6
-        bonus_reasons.append("보유인증 가점")
+        preference_points += 6
+        reasons.append("보유 인증 우대")
 
-    # 기업이 서술한 필요사항과 공고의 지원 유형이 겹치면 실제로 쓸모 있는 공고일 가능성이 높아
-    # 가장 큰 가점을 준다. 제품·목표 시장 같은 구체적 키워드가 공고에 나오면 추가로 가점을 준다.
-    matched_types = [t for t in (company.get("need_types") or []) if t in (parsed.get("support_types") or [])]
-    if matched_types:
-        score += 15
-        bonus_reasons.append(f"필요 분야 일치 ({', '.join(matched_types)})")
-    matched_keywords = needs.keyword_hits(company.get("need_keywords"), parsed, title)
-    if matched_keywords:
-        score += 6
-        bonus_reasons.append(f"관심 키워드 ({', '.join(matched_keywords[:3])})")
+    # 자격 확인: 공고에 조건이 있는데 기업 정보가 없어 확인하지 못한 항목마다 감점
+    unverified = []
+    if age is None and (min_years not in (None, "", "null") or max_years not in (None, "", "null")):
+        unverified.append("업력")
+    if not revenue_known and (min_revenue is not None or max_revenue is not None):
+        unverified.append("매출액")
+    if max_employees is not None and company_employees is None:
+        unverified.append("상시근로자 수")
+    if ceo_age is None and (min_ceo_age is not None or max_ceo_age is not None):
+        unverified.append("대표자 나이")
+    if business_entity_limit and not company_entity_type:
+        unverified.append("기업형태")
+    if industry_sections and not company_section:
+        unverified.append("업종")
+    certainty_points = max(0, SCORE_WEIGHTS["certainty"] - 5 * len(unverified))
 
-    score = min(score, 100)
+    components = {
+        "needs": min(needs_points, SCORE_WEIGHTS["needs"]),
+        "preference": min(preference_points, SCORE_WEIGHTS["preference"]),
+        "certainty": certainty_points,
+    }
+    has_needs = bool(company.get("need_types") or company.get("need_keywords"))
     return {
         "is_eligible": True,
-        "score": score,
-        "reason": ", ".join(bonus_reasons) if bonus_reasons else "기본 자격 충족",
+        "components": components,
+        "has_needs": has_needs,
+        "reasons": reasons,
+        "unverified": unverified,
+        "score": compose_score(components, has_needs),
+        "reason": describe(reasons, unverified),
         "need_match": bool(matched_types or matched_keywords),
     }
+
+
+def compose_score(components: dict, has_needs: bool) -> int:
+    keys = [k for k in SCORE_WEIGHTS if k in components and (k != "needs" or has_needs)]
+    available = sum(SCORE_WEIGHTS[k] for k in keys)
+    earned = sum(components[k] for k in keys)
+    return round(100 * earned / available) if available else 0
+
+
+def describe(reasons: list, unverified: list) -> str:
+    parts = list(reasons)
+    if unverified:
+        parts.append(f"확인 필요: {'·'.join(unverified)}")
+    return ", ".join(parts) if parts else "기본 자격 충족"
+
+
+def score_breakdown(result: dict) -> str:
+    """'관련도 45/50 · 필요 일치 24/30 · ...' 형태의 점수 구성 설명."""
+    components = result.get("components") or {}
+    return " · ".join(
+        f"{SCORE_LABELS[k]} {components[k]}/{SCORE_WEIGHTS[k]}"
+        for k in SCORE_WEIGHTS
+        if k in components and (k != "needs" or result.get("has_needs"))
+    )
 
 
 def _fetch_page_with_retry(run_query, attempts: int = 3) -> list:

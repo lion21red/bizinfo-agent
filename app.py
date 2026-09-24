@@ -1,6 +1,7 @@
 import os
 import json
 import re
+from datetime import date
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -129,6 +130,16 @@ def search_company_web_profile(company_name: str, region_hint: str = "") -> tupl
             sources.append({"title": chunk.web.title, "uri": chunk.web.uri})
 
     return profile, sources
+
+
+def deadline_label(end_date: str | None) -> str:
+    if not end_date:
+        return "상시/미정"
+    try:
+        days = (date.fromisoformat(end_date) - date.today()).days
+    except ValueError:
+        return end_date
+    return f"{end_date} (D-{days})" if days > 0 else f"{end_date} (오늘 마감)" if days == 0 else end_date
 
 
 def merge_profile(base: dict | None, updates: dict) -> dict:
@@ -566,7 +577,12 @@ if st.session_state.profile:
                 if result_keyword in (r.get("title") or "") or result_keyword in (r.get("department") or "")
             ]
 
-        result_filter_key = (tuple(sorted(selected_categories)), result_keyword, only_needs)
+        sort_order = st.radio("정렬", ["적합도순", "마감 임박순"], horizontal=True, key="match_sort_order")
+        if sort_order == "마감 임박순":
+            # 마감일이 없는(상시·미정) 공고는 뒤로, 같은 날 마감이면 적합도순
+            eligible = sorted(eligible, key=lambda r: (r.get("end_date") or "9999-12-31", -r["score"]))
+
+        result_filter_key = (tuple(sorted(selected_categories)), result_keyword, only_needs, sort_order)
         if st.session_state.get("match_result_filter_key") != result_filter_key:
             st.session_state.match_result_filter_key = result_filter_key
             st.session_state.match_page = 0
@@ -592,10 +608,11 @@ if st.session_state.profile:
                 header = f"[{r['score']}점] {r['title']}{badge}"
                 support_types = (r.get("parsed_data") or {}).get("support_types")
                 field_text = "/".join(support_types) if support_types else (r.get("category") or "분야 미상")
-                sub = f"{r.get('department') or '기관 미상'} · {field_text} · 마감 {r['end_date'] or '상시/미정'}"
+                sub = f"{r.get('department') or '기관 미상'} · {field_text} · 마감 {deadline_label(r.get('end_date'))}"
                 with st.expander(f"{header}  —  {sub}"):
                     parsed = r.get("parsed_data") or {}
 
+                    render_field("점수 구성", matcher.score_breakdown(r))
                     render_field("매칭 점수 사유", r["reason"])
                     if r.get("relevance") is not None:
                         render_field("AI 관련도", f"{r['relevance']}/10 — {r.get('relevance_reason') or ''}")

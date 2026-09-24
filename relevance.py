@@ -21,17 +21,13 @@ EMBED_DIM = 1536  # announcements.embedding 컬럼이 vector(1536)
 EMBED_BATCH = 100
 FETCH_CHUNK = 50
 
-SIMILARITY_MAX_BONUS = 10
 RERANK_TOP_N = 50
 RERANK_BATCH = 25  # 한 번에 평가할 공고 수 - 배치를 동시에 돌려 대기 시간을 늘리지 않는다
-RERANK_WEIGHT = 3  # 관련도 4 이상: (관련도 - 5) * 3 -> -3 ~ +15점
-LOW_RELEVANCE = 3  # 이하이면 다른 업종·제품용 공고로 보고 크게 감점해 목록 아래로 내린다
+LOW_RELEVANCE = 3  # 이하이면 다른 업종·제품용 공고로 본다
 
-
-def rerank_adjustment(relevance: int) -> int:
-    if relevance <= LOW_RELEVANCE:
-        return -25 - (LOW_RELEVANCE - relevance) * 5  # 3 -> -25, 0 -> -40
-    return (relevance - 5) * RERANK_WEIGHT
+# AI가 평가하지 않은 공고의 관련도는 유사도 순위로 2~6점(10점 기준)만 추정해서, 실제로 평가받아
+# 높은 점수를 받은 공고보다 앞서지 않게 한다.
+ESTIMATE_MIN, ESTIMATE_MAX = 2, 6
 
 
 def announcement_text(title: str, parsed: dict) -> str:
@@ -190,26 +186,31 @@ def rerank(company: dict, candidates: list[dict]) -> dict[str, dict]:
     return result
 
 
-def apply(company: dict, eligible: list[dict], use_rerank: bool = True) -> list[dict]:
-    """적격 공고 목록(각 항목에 id·title·parsed_data·score·reason)에 관련도를 반영해 다시 정렬한다.
+def _rescore(r: dict):
+    r["score"] = matcher.compose_score(r["components"], r["has_needs"])
+    r["reason"] = matcher.describe(r["reasons"], r["unverified"])
 
-    유사도는 적격 공고 안에서의 상대 순위로 0~10점 가점을 주고(가장 비슷한 공고 10점),
-    AI 재평가는 상위 RERANK_TOP_N건에만 관련도에 따라 점수를 더하거나 뺀다 (rerank_adjustment).
+
+def apply(company: dict, eligible: list[dict], use_rerank: bool = True) -> list[dict]:
+    """적격 공고 목록(matcher.match_announcement 결과에 id·title·parsed_data를 더한 항목)에
+    관련도 점수(SCORE_WEIGHTS["relevance"]점 만점)를 채우고 전체 점수를 다시 계산해 정렬한다.
+
+    먼저 모든 공고의 관련도를 임베딩 유사도 순위로 추정하고, 그 순서의 상위 RERANK_TOP_N건은
+    AI 평가(0~10점)로 바꾼다. AI가 관련도가 낮다고 본 공고는 지원 유형이 겹쳐도 실익이 없으므로
+    필요 일치·우대 점수도 0으로 둔다.
     """
     if not eligible:
         return eligible
 
+    weight = matcher.SCORE_WEIGHTS["relevance"]
     sims = similarity_scores(company, eligible)
-    if sims:
-        ordered = sorted((r for r in eligible if r["id"] in sims), key=lambda r: sims[r["id"]])
-        denom = max(1, len(ordered) - 1)
-        for rank, r in enumerate(ordered):
-            r["similarity"] = sims[r["id"]]
-            bonus = round(SIMILARITY_MAX_BONUS * rank / denom)
-            r["score"] += bonus
-            if bonus >= SIMILARITY_MAX_BONUS * 0.7:
-                r["reason"] += ", 기업 내용과 유사"
-
+    ordered = sorted(eligible, key=lambda r: sims.get(r["id"], 0.0))
+    denom = max(1, len(ordered) - 1)
+    for rank, r in enumerate(ordered):
+        r["similarity"] = sims.get(r["id"])
+        estimate = ESTIMATE_MIN + (ESTIMATE_MAX - ESTIMATE_MIN) * rank / denom if sims else (ESTIMATE_MIN + ESTIMATE_MAX) / 2
+        r["components"]["relevance"] = round(weight * estimate / 10)
+        _rescore(r)
     eligible.sort(key=lambda r: r["score"], reverse=True)
 
     if use_rerank:
@@ -220,13 +221,18 @@ def apply(company: dict, eligible: list[dict], use_rerank: bool = True) -> list[
             for result in pool.map(lambda b: rerank(company, b), batches):
                 judged.update(result)
         for r in top:
-            if r["id"] in judged:
-                j = judged[r["id"]]
-                r["relevance"] = j["relevance"]
-                r["relevance_reason"] = j["reason"]
-                r["score"] += rerank_adjustment(j["relevance"])
+            if r["id"] not in judged:
+                continue
+            j = judged[r["id"]]
+            r["relevance"] = j["relevance"]
+            r["relevance_reason"] = j["reason"]
+            r["components"]["relevance"] = round(weight * j["relevance"] / 10)
+            if j["relevance"] <= LOW_RELEVANCE:
+                # 다른 업종·제품용 공고면 지원 유형이 겹치거나 대분류가 같아 받은 점수도 의미가 없다
+                r["components"]["needs"] = 0
+                r["components"]["preference"] = 0
+                r["need_match"] = False
+            _rescore(r)
         eligible.sort(key=lambda r: r["score"], reverse=True)
 
-    for r in eligible:
-        r["score"] = max(0, min(100, r["score"]))
     return eligible
