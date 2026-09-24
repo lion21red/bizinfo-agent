@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 
 import ksic
+import needs
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -92,7 +93,7 @@ def _region_matches(company_region: str, location_limit: list) -> bool:
     return False
 
 
-def match_announcement(company: dict, parsed: dict) -> dict:
+def match_announcement(company: dict, parsed: dict, title: str = "") -> dict:
     """기업 프로필과 파싱된 공고 조건을 비교해 적합도를 산출"""
     # 예비창업자 여부가 명시적으로 확인된 경우에만 업력 0으로 취급한다.
     # 설립일을 모른다고 해서 예비창업자로 단정하지 않고, 업력을 알 수 없는
@@ -223,8 +224,24 @@ def match_announcement(company: dict, parsed: dict) -> dict:
         score += 6
         bonus_reasons.append("보유인증 가점")
 
+    # 기업이 서술한 필요사항과 공고의 지원 유형이 겹치면 실제로 쓸모 있는 공고일 가능성이 높아
+    # 가장 큰 가점을 준다. 제품·목표 시장 같은 구체적 키워드가 공고에 나오면 추가로 가점을 준다.
+    matched_types = [t for t in (company.get("need_types") or []) if t in (parsed.get("support_types") or [])]
+    if matched_types:
+        score += 15
+        bonus_reasons.append(f"필요 분야 일치 ({', '.join(matched_types)})")
+    matched_keywords = needs.keyword_hits(company.get("need_keywords"), parsed, title)
+    if matched_keywords:
+        score += 6
+        bonus_reasons.append(f"관심 키워드 ({', '.join(matched_keywords[:3])})")
+
     score = min(score, 100)
-    return {"is_eligible": True, "score": score, "reason": ", ".join(bonus_reasons) if bonus_reasons else "기본 자격 충족"}
+    return {
+        "is_eligible": True,
+        "score": score,
+        "reason": ", ".join(bonus_reasons) if bonus_reasons else "기본 자격 충족",
+        "need_match": bool(matched_types or matched_keywords),
+    }
 
 
 def _fetch_page_with_retry(run_query, attempts: int = 3) -> list:
@@ -303,7 +320,7 @@ def run_matching():
     results = []
     for item in records:
         parsed = item.get("parsed_data") or {}
-        result = match_announcement(COMPANY_PROFILE, parsed)
+        result = match_announcement(COMPANY_PROFILE, parsed, item.get("title", ""))
         results.append({
             "title": item.get("title", ""),
             "end_date": item.get("end_date"),

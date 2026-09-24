@@ -9,6 +9,7 @@ from google.genai import types
 
 import ksic
 import matcher
+import needs
 from pdf_utils import extract_pdf_content
 from ui_helpers import render_field, render_field_grid
 
@@ -45,7 +46,8 @@ PROFILE_PROMPT_TEMPLATE = """
   "is_reentrepreneur": "재창업/재도전 기업 여부 (폐업 후 다시 창업한 경우, true/false)",
   "certifications": "보유 인증 목록 (이노비즈, 메인비즈, ISO 등을 쉼표로 구분한 문자열, 없으면 빈 문자열)",
   "is_pre_founder": "예비창업자 여부. 문서 자체가 '예비창업패키지 신청서'이거나 '사업자등록 예정' 등 아직 사업자등록 전임을 명확히 밝히는 경우에만 true. 단순히 설립일을 문서에서 확인하지 못한 경우는 false로 두세요 (설립일 미확인과 예비창업자는 다른 의미입니다)",
-  "detail_notes": "회사 개요, 연혁, 주요 제품/서비스, 강점/실적 등을 나중에 신청서·사업계획서 작성 시 참고할 수 있도록 자유 서술로 구체적으로 요약 (없으면 빈 문자열)"
+  "detail_notes": "회사 개요, 연혁, 주요 제품/서비스, 강점/실적 등을 나중에 신청서·사업계획서 작성 시 참고할 수 있도록 자유 서술로 구체적으로 요약 (없으면 빈 문자열)",
+  "needs_text": "자료에 명시된 향후 사업 계획이나 필요한 지원 (예: 신제품 개발 자금, 해외 수출 추진, 인력 채용 계획)을 자유 서술로 정리 (명시되지 않았으면 빈 문자열, 추측 금지)"
 }}
 """
 
@@ -161,6 +163,9 @@ def save_company(profile: dict):
         "is_pre_founder": profile.get("is_pre_founder", False),
         "detail_notes": profile.get("detail_notes") or "",
         "industry_section": profile.get("industry_section") or None,
+        "needs_text": profile.get("needs_text") or "",
+        "need_types": profile.get("need_types") or [],
+        "need_keywords": profile.get("need_keywords") or [],
     }
     # company_name 기준 upsert: 같은 회사를 다시 저장하면 새 행을 만들지 않고 기존 값을 덮어쓴다.
     # (companies.company_name에 UNIQUE 제약이 있어야 동작함 - sql/dedupe_companies.sql 참고)
@@ -227,6 +232,11 @@ with st.expander("💾 저장된 기업 불러오기"):
                 "is_pre_founder": c.get("is_pre_founder"),
                 "detail_notes": c.get("detail_notes"),
                 "industry_section": c.get("industry_section"),
+                "needs_text": c.get("needs_text"),
+                "need_types": c.get("need_types") or [],
+                "need_keywords": c.get("need_keywords") or [],
+                # 저장된 분석 결과는 저장 당시 서술에 대한 것이므로, 서술을 고치지 않는 한 다시 분석하지 않는다.
+                "needs_analyzed_text": c.get("needs_text"),
             }
     else:
         st.caption("아직 저장된 기업이 없습니다.")
@@ -391,6 +401,36 @@ if st.session_state.profile:
         height=120,
     )
 
+    needs_text = st.text_area(
+        "현재 필요사항·추진 계획 (자유 서술 — AI가 분석해서 필요한 분야의 공고를 우선 추천합니다)",
+        p.get("needs_text") or "",
+        height=110,
+        placeholder="예: 올해 베트남 수출을 시작하려고 해서 해외 전시회 참가와 현지 바이어 발굴이 급합니다. "
+        "창고 확장용 운전자금 대출도 알아보고 있고, 영업직 2명을 채용할 계획입니다.",
+    )
+    n_col1, n_col2 = st.columns([3, 2])
+    with n_col1:
+        need_types = st.multiselect(
+            "필요 지원 분야 (AI 분석 결과 — 직접 고쳐도 됩니다)",
+            list(needs.SUPPORT_TYPES),
+            default=needs.valid_types(p.get("need_types")),
+        )
+    with n_col2:
+        need_keywords_text = st.text_input(
+            "관심 키워드 (쉼표로 구분)", ", ".join(p.get("need_keywords") or [])
+        )
+    need_keywords = needs.valid_keywords(need_keywords_text.split(","))
+    if st.button("🧠 필요사항 AI 분석", disabled=not needs_text.strip()):
+        with st.spinner("AI가 필요사항을 분석하는 중..."):
+            try:
+                analysis = needs.analyze_company_needs(needs_text, industry, detail_notes)
+                st.session_state.profile.update(
+                    {**analysis, "needs_text": needs_text, "needs_analyzed_text": needs_text}
+                )
+                st.rerun()
+            except Exception as e:
+                st.error(f"분석 중 오류가 발생했습니다: {e}")
+
     confirmed_profile = {
         "company_name": company_name,
         "ceo_name": ceo_name or None,
@@ -412,6 +452,9 @@ if st.session_state.profile:
         "is_pre_founder": is_pre_founder,
         "detail_notes": detail_notes,
         "industry_section": industry_section,
+        "needs_text": needs_text,
+        "need_types": need_types,
+        "need_keywords": need_keywords,
     }
 
     btn_col1, btn_col2 = st.columns(2)
@@ -427,6 +470,18 @@ if st.session_state.profile:
             confirmed_profile["industry_section"] = ksic.classify_company_industry(industry, detail_notes)
             st.session_state.profile["industry_section"] = confirmed_profile["industry_section"]
 
+        # 필요사항을 새로 쓰거나 고친 뒤 분석 버튼을 누르지 않았으면 여기서 분석한다. 이미 분석한
+        # 서술이면 컨설턴트가 직접 고친 분야·키워드를 그대로 둔다.
+        if needs_text.strip() and needs_text != p.get("needs_analyzed_text"):
+            try:
+                analysis = needs.analyze_company_needs(needs_text, industry, detail_notes)
+                confirmed_profile.update(analysis)
+                st.session_state.profile.update(
+                    {**analysis, "needs_text": needs_text, "needs_analyzed_text": needs_text}
+                )
+            except Exception as e:
+                st.warning(f"필요사항 분석에 실패해 입력된 분야·키워드로 진행합니다 ({e})")
+
     if save_clicked:
         try:
             save_company(confirmed_profile)
@@ -440,7 +495,7 @@ if st.session_state.profile:
             results = []
             for item in records:
                 parsed = item.get("parsed_data") or {}
-                r = matcher.match_announcement(confirmed_profile, parsed)
+                r = matcher.match_announcement(confirmed_profile, parsed, item.get("title", ""))
                 results.append(
                     {
                         "title": item.get("title", ""),
@@ -486,6 +541,16 @@ if st.session_state.profile:
 
         eligible = [r for r in eligible_all if (r.get("category") or "미분류") in selected_categories]
 
+        need_matched_count = sum(1 for r in eligible if r.get("need_match"))
+        only_needs = st.checkbox(
+            f"필요사항에 맞는 공고만 보기 ({need_matched_count}건)",
+            value=False,
+            disabled=need_matched_count == 0,
+            key="only_need_match",
+        )
+        if only_needs:
+            eligible = [r for r in eligible if r.get("need_match")]
+
         result_keyword = st.text_input("결과 내 검색 (공고명·기관으로)", key="match_result_search")
         if result_keyword:
             eligible = [
@@ -493,7 +558,7 @@ if st.session_state.profile:
                 if result_keyword in (r.get("title") or "") or result_keyword in (r.get("department") or "")
             ]
 
-        result_filter_key = (tuple(sorted(selected_categories)), result_keyword)
+        result_filter_key = (tuple(sorted(selected_categories)), result_keyword, only_needs)
         if st.session_state.get("match_result_filter_key") != result_filter_key:
             st.session_state.match_result_filter_key = result_filter_key
             st.session_state.match_page = 0
@@ -513,7 +578,9 @@ if st.session_state.profile:
                 is_pdf = (r.get("attachment_filename") or "").lower().endswith(".pdf")
                 badge = " 📄PDF 심층분석" if is_pdf else ""
                 header = f"[{r['score']}점] {r['title']}{badge}"
-                sub = f"{r.get('department') or '기관 미상'} · {r.get('category') or '분야 미상'} · 마감 {r['end_date'] or '상시/미정'}"
+                support_types = (r.get("parsed_data") or {}).get("support_types")
+                field_text = "/".join(support_types) if support_types else (r.get("category") or "분야 미상")
+                sub = f"{r.get('department') or '기관 미상'} · {field_text} · 마감 {r['end_date'] or '상시/미정'}"
                 with st.expander(f"{header}  —  {sub}"):
                     parsed = r.get("parsed_data") or {}
 
