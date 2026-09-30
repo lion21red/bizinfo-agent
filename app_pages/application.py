@@ -458,9 +458,23 @@ st.subheader("4. 초안 검토·수정", anchor=False)
 c_draft, c_chat = st.columns([3, 2])
 
 with c_draft:
-    st.caption("각 항목을 직접 고치거나, 오른쪽에서 AI에게 수정을 요청하세요.")
+    st.caption("각 항목을 직접 고치거나, 오른쪽에서 AI에게 수정을 요청하세요. 표는 마크다운 표로 쓰여 있고 아래에서 미리 볼 수 있습니다.")
+    meta = {s["section_name"]: s for s in requirements.get("form_sections") or [] if s.get("section_name")}
+    chapter = None
     for name in st.session_state.aw_draft_sections:
-        st.text_area(name, key=_section_key(name), height=200)
+        s = meta.get(name, {})
+        if s.get("chapter") and s["chapter"] != chapter:
+            chapter = s["chapter"]
+            st.markdown(f"##### {chapter}")
+        text = st.session_state.get(_section_key(name), "")
+        badges = [TYPE_BADGES.get(s.get("type"), "")] if s.get("type") else []
+        info = f":gray[{len(text):,}자" + (f" · 양식 제한 {s['length_limit']}" if s.get("length_limit") else "") + "]"
+        st.markdown(f"**{name}** " + " ".join([b for b in badges if b] + [info]))
+        height = {"기재란": 160, "표": 200}.get(s.get("type"), 240)
+        st.text_area(name, key=_section_key(name), height=height, label_visibility="collapsed")
+        if any(kind == "table" for kind, _ in application_writer.split_blocks(text)):
+            with st.expander("표 미리보기", icon=":material/table:"):
+                st.markdown(text)
 
 with c_chat:
     with st.container(border=True):
@@ -515,7 +529,7 @@ with st.container(border=True):
                 st.error(f"저장하지 못했습니다: {e}")
         st.download_button(
             "초안 다운로드 (.docx)",
-            data=application_writer.build_docx(ann, st.session_state.aw_company_profile, _current_sections()),
+            data=application_writer.build_docx(ann, st.session_state.aw_company_profile, _current_sections(), requirements),
             file_name=f"{ann.get('title') or '신청서'}_초안.docx",
             mime=DOCX_MIME,
             icon=":material/download:",
@@ -570,7 +584,7 @@ with st.container(border=True):
             try:
                 if template_bytes is None:
                     template_bytes = application_writer.fetch_docx_bytes(selected_template["url"])
-                fill_result = application_writer.fill_docx_template(template_bytes, _current_sections())
+                fill_result = application_writer.fill_docx_template(template_bytes, _current_sections(), requirements)
                 st.session_state.aw_filled_docx = fill_result["buffer"].getvalue()
                 st.session_state.aw_filled_docx_name = template_name
                 st.session_state.aw_filled_docx_matched = fill_result["matched"]

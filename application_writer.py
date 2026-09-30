@@ -8,6 +8,7 @@ import io
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from google import genai
@@ -53,6 +54,12 @@ REQUIREMENTS_PROMPT_TEMPLATE = """
      표가 함께 있으면 절 하나를 "서술"로 두고 표는 guidance에 적으세요. 표만 있는 절은 "표"입니다.
    - "서술": 글로 작성하는 부분
    요약문이 있으면 "요약문"을 항목 하나로 두세요.
+   "기재란"은 fields에 채울 칸 이름을 양식 순서대로(예: ["기업명", "대표자 성명", "설립 년월일"]), "표"는
+   table_columns에 열 제목을 양식 그대로 적고, 행 제목이 정해져 있으면 table_rows에 적으세요
+   (예: 추진일정표의 ["분석", "설계", "테스트"]). 머리글이 두 줄로 나뉜 표(예: "추진일정(월)" 아래 6~12월)는
+   아래 줄의 칸을 각각 별도 열로 적으세요 (예: "6월", "7월", ...). "서술"이지만 양식에 함께 채울 표가 있으면 그 표의 열
+   제목도 table_columns에 적으세요. 양식에 값이 이미 인쇄돼 있는 칸(예: 실증기간 "협약일 ~ 2026. 12. 31.",
+   지원금 한도 "기업당 최대 5천만원 이내")은 preset_values에 {{"칸 이름": "인쇄된 값"}}으로 적으세요.
 4. 작성 항목이 아닌 것은 넣지 마세요: 평가표, 제출서류 목록, 개인정보 동의서, 서약서·확약서, 목차.
 5. form_guidance에는 양식에 적힌 작성요령(예: "<작성내용 및 방법>", "※ ~ 기재" 안내문)을 원문 그대로
    옮기세요. 없으면 빈 문자열. guidance에는 심사 기준을 고려해 무엇을 어떤 관점으로 쓰면 좋은지 조언하세요.
@@ -82,6 +89,10 @@ REQUIREMENTS_PROMPT_TEMPLATE = """
     "guidance": "작성 조언",
     "length_limit": "",
     "evaluation": "",
+    "fields": ["기재란의 칸 이름"],
+    "table_columns": ["표의 열 제목"],
+    "table_rows": ["표의 정해진 행 제목"],
+    "preset_values": {{"칸 이름": "양식에 인쇄된 값"}},
     "source": "양식 | 추정"
   }}],
   "evaluation_criteria": [{{"item": "평가 항목", "points": 배점 숫자 또는 null, "details": "세부 기준 요약"}}],
@@ -104,15 +115,29 @@ DRAFT_PROMPT_TEMPLATE = """
 - 추진 계획류 항목은 월차/분기별 마일스톤처럼 시간 순서가 드러나게, 예산/기대효과류 항목은 항목별
   세부 내역이 드러나게 작성하세요.
 - 각 항목의 form_guidance(양식에 적힌 작성요령)를 빠짐없이 따르고, length_limit(분량 제한)가 있으면
-  지키세요. evaluation(연결된 평가 항목·배점)이 큰 항목일수록 더 구체적으로 쓰세요.
-- type이 "기재란"인 항목은 "칸 이름: 값" 형태의 줄로, "표"인 항목은 마크다운 표로 작성하세요. 이 두
-  종류에는 500자 기준을 적용하지 않습니다. 기업 정보에 있는 값은 채우고 없는 값은 [확인 필요]로 두세요.
+  지키세요 (A4 1쪽은 대략 1,200~1,500자). evaluation(연결된 평가 항목·배점)이 큰 항목일수록 더 구체적으로 쓰세요.
+- 전체 목차에서 다른 항목이 다룰 내용은 이번 항목에 반복하지 말고, 이번 항목의 초점에 집중하세요.
+
+양식 모양 기준:
+- type이 "기재란"인 항목은 fields의 칸마다 "칸 이름: 값" 한 줄씩, fields 순서대로 쓰세요. 설명 문장은 쓰지
+  마세요. 기업 정보에 있는 값은 양식 단위(예: 백만원, 천원)에 맞게 환산해 채우고, 없는 값은
+  "[확인 필요: 칸 이름]"으로 두세요.
+- preset_values(양식에 이미 인쇄된 값, 예: 실증기간)가 있는 칸은 그 값을 그대로 쓰세요. 날짜·기간을 제안할
+  때는 오늘({today}) 이후로 하세요.
+- type이 "표"인 항목은 table_columns를 열 제목으로 하는 마크다운 표로 쓰세요 (table_rows가 있으면 그 행을
+  모두 포함). 표 앞뒤에 한두 문장의 설명은 붙여도 됩니다. 500자 기준은 적용하지 않습니다.
+- type이 "서술"이지만 table_columns가 있는 항목은 서술 뒤에 그 열 제목으로 된 마크다운 표를 함께 쓰세요
+  (예: 실증 목표 + 성과지표표, 추진일정 + 월별 일정표).
+- 마크다운 표는 "| 열1 | 열2 |" 줄과 "|---|---|" 구분 줄을 쓰는 표준 형식으로만 쓰세요.
 
 [기업 정보]
 {company_profile_json}
 
 [추가 자료 (사업 내용, 실적 등)]
 {extra_context}
+
+[전체 목차 (참고 - 이번에 작성할 항목은 아래 "작성해야 할 항목")]
+{outline_json}
 
 [작성해야 할 항목 및 가이드]
 {form_sections_json}
@@ -123,6 +148,27 @@ DRAFT_PROMPT_TEMPLATE = """
 [출력 형식]
 반드시 아래 JSON 형식으로만 답하세요. 키는 위 "작성해야 할 항목"의 section_name과 정확히 일치시키세요.
 {{"<section_name>": "<초안 본문>", "...": "..."}}
+"""
+
+SUMMARY_PROMPT_TEMPLATE = """
+당신은 대한민국 정부 지원사업 신청서 작성을 돕는 컨설턴트입니다. 아래는 이미 작성된 사업계획서 본문
+초안입니다. 이 본문을 바탕으로 양식의 요약문 항목을 작성하세요.
+
+- 양식 작성요령(form_guidance)의 구성과 순서를 그대로 따르세요. 칸이 나뉜 양식이면 "칸 이름: 내용" 줄로 쓰세요.
+- 분량 제한(length_limit)을 반드시 지키세요. "1쪽 이내"면 전체 1,300자 이내로 쓰세요 (칸 이름 포함).
+- 칸마다 한두 문장으로 핵심만 쓰고, 본문 문장을 길게 옮겨 오지 마세요.
+- preset_values(양식에 이미 인쇄된 값)가 있는 칸은 그 값을 그대로 쓰세요.
+- 본문에 없는 새로운 수치·사실을 만들지 마세요. 본문의 [확인 필요] 표시는 그대로 유지하세요.
+- 심사위원이 요약문만 읽고도 핵심(필요성, 목표, 차별성, 기대효과)을 파악할 수 있게 압축하세요.
+
+[요약문 항목]
+{section_json}
+
+[본문 초안]
+{body_json}
+
+[출력 형식]
+반드시 JSON으로만 답하세요: {{"text": "<요약문>"}}
 """
 
 REFINE_CHAT_PROMPT_TEMPLATE = """
@@ -170,6 +216,8 @@ TEMPLATE_MAP_PROMPT = """
 위치 후보를 찾아 매핑하세요. 라벨의 표현이 완전히 같지 않아도 의미상 대응되면 매핑하세요
 (예: 항목명 "지원 동기" ↔ 라벨 "1. 신청 배경 및 수출 필요성"). 해당하는 후보를 찾을 수 없으면
 -1로 표시하세요. 서로 다른 항목을 같은 후보에 매핑하지 마세요.
+"표지 > 기업명"처럼 "항목 > 칸" 형태인 것은 기재란의 칸 하나이므로, 그 칸 이름과 같은 라벨의 표 셀
+후보(kind "table_cell")에 매핑하세요.
 
 [위치 후보 목록]
 {targets_json}
@@ -329,9 +377,24 @@ def _normalize_sections(sections) -> list[dict]:
             "guidance": str(s.get("guidance") or "").strip(),
             "length_limit": str(s.get("length_limit") or "").strip(),
             "evaluation": str(s.get("evaluation") or "").strip(),
+            "fields": _str_list(s.get("fields")),
+            "table_columns": _str_list(s.get("table_columns")),
+            "table_rows": _str_list(s.get("table_rows")),
+            "preset_values": {
+                str(k).strip(): str(v).strip()
+                for k, v in (s.get("preset_values") or {}).items() if str(k).strip() and str(v).strip()
+            } if isinstance(s.get("preset_values"), dict) else {},
             "source": "추정" if s.get("source") == "추정" else "양식",
         })
     return result
+
+
+def _str_list(value) -> list[str]:
+    return [_PRIVATE_USE.sub("", str(v)).strip() for v in value or [] if str(v).strip()] if isinstance(value, list) else []
+
+
+def is_summary(section: dict) -> bool:
+    return "요약" in section.get("section_name", "")
 
 
 _ROMAN_HEADING = re.compile(r"^\s*([ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ])\s*[.．]\s*(\S.*)$")
@@ -378,15 +441,19 @@ def format_criterion(c) -> str:
     return str(c)
 
 
-def draft_application_sections(company_profile: dict, extra_context: str, requirements: dict) -> dict:
-    sections = requirements.get("form_sections") or []
-    if not sections:
-        return {}
+# 한 번의 호출로 쓰는 항목 수. 양식 항목이 10개를 넘는 경우가 많은데 한꺼번에 쓰게 하면 뒤쪽 항목이
+# 짧아지거나 빠지므로, 몇 개씩 나눠 동시에 쓰게 한다.
+DRAFT_BATCH_SIZE = 4
 
+
+def _draft_batch(batch: list[dict], outline: list[str], company_profile: dict, extra_context: str,
+                 requirements: dict) -> dict:
     prompt = DRAFT_PROMPT_TEMPLATE.format(
         company_profile_json=json.dumps(company_profile, ensure_ascii=False),
         extra_context=extra_context or "(없음)",
-        form_sections_json=json.dumps(sections, ensure_ascii=False),
+        outline_json=json.dumps(outline, ensure_ascii=False),
+        today=datetime.now().strftime("%Y-%m-%d"),
+        form_sections_json=json.dumps(batch, ensure_ascii=False),
         evaluation_criteria_json=json.dumps(requirements.get("evaluation_criteria") or [], ensure_ascii=False),
     )
     response = ai_client.models.generate_content(
@@ -395,13 +462,47 @@ def draft_application_sections(company_profile: dict, extra_context: str, requir
         config={"response_mime_type": "application/json"},
     )
     drafted = _parse_json_response(response)
+    return {s["section_name"]: str(drafted.get(s["section_name"]) or "") for s in batch}
 
-    # AI가 일부 항목을 누락해도 화면에 빈 칸으로라도 항상 표시되도록 보정
-    for s in sections:
-        name = s.get("section_name")
-        if name and name not in drafted:
-            drafted[name] = ""
-    return drafted
+
+def _draft_summary(section: dict, body: dict) -> str:
+    prompt = SUMMARY_PROMPT_TEMPLATE.format(
+        section_json=json.dumps(section, ensure_ascii=False),
+        body_json=json.dumps(body, ensure_ascii=False),
+    )
+    response = ai_client.models.generate_content(
+        model=WRITING_MODEL,
+        contents=prompt,
+        config={"response_mime_type": "application/json"},
+    )
+    return str(_parse_json_response(response).get("text") or "")
+
+
+def draft_application_sections(company_profile: dict, extra_context: str, requirements: dict) -> dict:
+    """양식 항목별 초안. 본문 항목은 몇 개씩 나눠 동시에 쓰고, 요약문은 본문을 다 쓴 뒤 그 내용을
+    바탕으로 마지막에 쓴다 (본문보다 요약문을 먼저 쓰면 본문과 어긋나기 쉽다).
+    반환 순서는 양식 순서와 같다."""
+    sections = requirements.get("form_sections") or []
+    if not sections:
+        return {}
+    outline = [s["section_name"] for s in sections]
+    body_sections = [s for s in sections if not is_summary(s)]
+    summary_sections = [s for s in sections if is_summary(s)]
+
+    batches = [body_sections[i:i + DRAFT_BATCH_SIZE] for i in range(0, len(body_sections), DRAFT_BATCH_SIZE)]
+    drafted = {}
+    with ThreadPoolExecutor(max_workers=max(1, len(batches))) as pool:
+        for result in pool.map(
+            lambda b: _draft_batch(b, outline, company_profile, extra_context, requirements), batches
+        ):
+            drafted.update(result)
+
+    body = {name: drafted[name] for name in outline if name in drafted}
+    for s in summary_sections:
+        drafted[s["section_name"]] = _draft_summary(s, body)
+
+    # AI가 일부 항목을 빠뜨려도 화면에 빈 칸으로라도 항상 표시되도록, 양식 순서대로 채운다
+    return {name: drafted.get(name, "") for name in outline}
 
 
 def refine_draft_via_chat(
@@ -599,6 +700,78 @@ def _style_or_none(doc: Document, style_name: str):
         return None
 
 
+_MD_TABLE_SEPARATOR = re.compile(r"^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?$")
+_FIELD_LINE = re.compile(r"^[-•·*]?\s*([^:：|]{1,40}?)\s*[:：]\s*(.*)$")
+
+
+def split_blocks(text: str) -> list[tuple[str, object]]:
+    """초안 본문을 글 줄과 마크다운 표로 나눈다: [("text", 줄), ("table", [[칸, ...], ...]), ...]"""
+    blocks, table = [], []
+    for line in (text or "").split("\n"):
+        s = line.strip()
+        if s.startswith("|") and s.count("|") >= 2:
+            if not _MD_TABLE_SEPARATOR.match(s):
+                table.append([c.strip() for c in s.strip("|").split("|")])
+            continue
+        if table:
+            blocks.append(("table", table))
+            table = []
+        if s:
+            blocks.append(("text", s))
+    if table:
+        blocks.append(("table", table))
+    return blocks
+
+
+def parse_fields(text: str) -> list[tuple[str, str]]:
+    """기재란 초안("칸: 값" 줄)을 (칸, 값) 목록으로. 대부분의 줄이 그 형태가 아니면 빈 목록."""
+    lines = [line.strip() for line in (text or "").split("\n") if line.strip()]
+    pairs = [m.groups() for m in (_FIELD_LINE.match(line) for line in lines) if m]
+    return [(k.strip(), v.strip()) for k, v in pairs] if lines and len(pairs) >= 0.6 * len(lines) else []
+
+
+def _fill_table(table, rows: list[list[str]], comments: list, header: bool = True):
+    table.style = "Table Grid"
+    for r_idx, row in enumerate(rows):
+        for c_idx, cell in enumerate(table.rows[r_idx].cells):
+            value = row[c_idx] if c_idx < len(row) else ""
+            _add_body_text(cell.paragraphs[0], value, comments)
+            if header and r_idx == 0:
+                _set_cell_background(cell, DOCX_LIGHT_BLUE)
+                for run in cell.paragraphs[0].runs:
+                    run.bold = True
+
+
+def _new_table(doc: Document, rows: list[list[str]]):
+    return doc.add_table(rows=len(rows), cols=max(len(r) for r in rows))
+
+
+def _add_blocks(doc: Document, text: str, comments: list):
+    """글 줄은 문단으로, 마크다운 표는 Word 표로 문서 끝에 추가한다."""
+    for kind, value in split_blocks(text):
+        if kind == "table":
+            _fill_table(_new_table(doc, value), value, comments)
+            doc.add_paragraph()
+        else:
+            body_p = doc.add_paragraph()
+            body_p.paragraph_format.line_spacing = 1.3
+            body_p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            _add_body_text(body_p, value, comments)
+
+
+def _add_field_table(doc: Document, fields: list[tuple[str, str]], comments: list):
+    table = doc.add_table(rows=len(fields), cols=2)
+    table.style = "Table Grid"
+    _lock_table_layout(table, Cm(16.7))
+    for row, (label, value) in zip(table.rows, fields):
+        label_cell, value_cell = row.cells
+        label_cell.width, value_cell.width = Cm(4.5), Cm(12.2)
+        _set_cell_background(label_cell, DOCX_LIGHT_BLUE)
+        label_cell.paragraphs[0].add_run(label).bold = True
+        _add_body_text(value_cell.paragraphs[0], value, comments)
+    doc.add_paragraph()
+
+
 def _add_page_number_footer(doc: Document):
     footer_p = doc.sections[0].footer.paragraphs[0]
     footer_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -617,7 +790,11 @@ def _add_page_number_footer(doc: Document):
     run._r.append(fld_end)
 
 
-def build_docx(announcement: dict, company_profile: dict, sections: dict) -> io.BytesIO:
+def _section_meta(requirements: dict | None) -> dict:
+    return {s["section_name"]: s for s in (requirements or {}).get("form_sections") or [] if s.get("section_name")}
+
+
+def build_docx(announcement: dict, company_profile: dict, sections: dict, requirements: dict | None = None) -> io.BytesIO:
     """참고 문서(그라데이션 배너 + 카드형 섹션) 스타일을 python-docx로 재현한 신청서 초안.
     - 파란 제목 배너 + 메타정보 표로 한눈에 어떤 공고/기업용 초안인지 보이게 하고
     - 섹션마다 왼쪽 컬러 바로 구획을 나누고
@@ -703,9 +880,21 @@ def build_docx(announcement: dict, company_profile: dict, sections: dict) -> io.
     note_run.font.size = Pt(9.5)
     note_run.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
 
-    # 섹션 본문
+    # 섹션 본문 (양식의 장 제목 -> 항목 제목 -> 본문. 기재란은 2열 표, 마크다운 표는 Word 표로)
+    meta = _section_meta(requirements)
     comments: list[str] = []
+    chapter = None
     for idx, (name, text) in enumerate(sections.items(), start=1):
+        s = meta.get(name, {})
+        if s.get("chapter") and s["chapter"] != chapter:
+            chapter = s["chapter"]
+            chapter_p = doc.add_paragraph(style=_style_or_none(doc, "Heading 1"))
+            chapter_p.paragraph_format.space_before = Pt(20)
+            chapter_run = chapter_p.add_run(chapter)
+            chapter_run.bold = True
+            chapter_run.font.size = Pt(15)
+            chapter_run.font.color.rgb = DOCX_NAVY
+
         # 실제 "제목 2" 스타일을 적용해두면 Word의 탐색 창(개요)에 섹션이 잡히고,
         # 나중에 목차(TOC)를 넣어도 자동으로 인식된다 - 색상/테두리는 이후 직접 다시 덮어써서
         # 스타일 적용 여부와 무관하게 지금까지의 디자인을 그대로 유지한다.
@@ -713,18 +902,17 @@ def build_docx(announcement: dict, company_profile: dict, sections: dict) -> io.
         heading_p.paragraph_format.space_before = Pt(18)
         heading_p.paragraph_format.space_after = Pt(6)
         _add_left_accent_border(heading_p)
-        heading_run = heading_p.add_run(f"{idx}. {name}")
+        # 양식 번호가 이름에 붙어 있으면(예: "Ⅰ-1 ...") 일련번호를 따로 달지 않는다
+        heading_run = heading_p.add_run(name if s.get("section_id") else f"{idx}. {name}")
         heading_run.bold = True
         heading_run.font.size = Pt(13)
         heading_run.font.color.rgb = DOCX_NAVY
 
-        for para_text in (text or "").split("\n"):
-            if not para_text.strip():
-                continue
-            body_p = doc.add_paragraph()
-            body_p.paragraph_format.line_spacing = 1.3
-            body_p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-            _add_body_text(body_p, para_text, comments)
+        fields = parse_fields(text) if s.get("type") == "기재란" else []
+        if fields:
+            _add_field_table(doc, fields, comments)
+        else:
+            _add_blocks(doc, text, comments)
 
     _add_page_number_footer(doc)
     _attach_comments(doc, comments)
@@ -739,14 +927,6 @@ def fetch_docx_bytes(url: str) -> bytes:
     resp = requests.get(url, timeout=20)
     resp.raise_for_status()
     return resp.content
-
-
-def _insert_paragraph_after(paragraph: Paragraph) -> Paragraph:
-    """python-docx엔 '이 문단 뒤에 새 문단 삽입' API가 없어서(항상 문서 끝에만 추가 가능),
-    같은 위치에 원소를 만들어 addnext로 옆에 꽂아주는 방식으로 직접 구현한다."""
-    new_p = OxmlElement("w:p")
-    paragraph._p.addnext(new_p)
-    return Paragraph(new_p, paragraph._parent)
 
 
 def _collect_fill_targets(doc: Document) -> list[dict]:
@@ -815,7 +995,48 @@ def _append_lines_to_cell(cell, text: str, comments: list[str]):
         _add_body_text(cell.add_paragraph(), line, comments)
 
 
-def fill_docx_template(template_bytes: bytes, sections: dict) -> dict:
+def _expand_fields(sections: dict, requirements: dict | None) -> dict:
+    """기재란 항목은 "칸: 값" 줄마다 "항목 > 칸"으로 나눠, 양식 표의 해당 칸에 하나씩 넣을 수 있게 한다."""
+    meta = _section_meta(requirements)
+    expanded = {}
+    for name, text in sections.items():
+        fields = parse_fields(text) if meta.get(name, {}).get("type") == "기재란" else []
+        if fields:
+            for label, value in fields:
+                expanded[f"{name} > {label}"] = value
+        else:
+            expanded[name] = text
+    return expanded
+
+
+def _insert_blocks_after(doc: Document, anchor, text: str, comments: list):
+    """anchor(문단) 바로 뒤에 글 줄은 문단으로, 마크다운 표는 Word 표로 차례대로 끼워 넣는다.
+    python-docx엔 '이 문단 뒤에 삽입' API가 없어(항상 문서 끝에만 추가), 원소를 만들어
+    addnext로 제자리에 꽂는다."""
+    anchor_el = anchor._p
+    for kind, value in split_blocks(text):
+        if kind == "table":
+            table = _new_table(doc, value)  # 문서 끝에 만든 뒤 제자리로 옮긴다
+            _fill_table(table, value, comments)
+            anchor_el.addnext(table._tbl)
+            anchor_el = table._tbl
+        else:
+            new_p = OxmlElement("w:p")
+            anchor_el.addnext(new_p)
+            paragraph = Paragraph(new_p, anchor._parent)
+            _add_body_text(paragraph, value, comments)
+            anchor_el = new_p
+
+
+def _as_cell_text(text: str) -> str:
+    """표 칸 안에는 표를 넣지 않고, 마크다운 표 행을 "칸 | 칸" 줄로 바꿔 넣는다."""
+    lines = []
+    for kind, value in split_blocks(text):
+        lines.extend(" | ".join(row) for row in value) if kind == "table" else lines.append(value)
+    return "\n".join(lines)
+
+
+def fill_docx_template(template_bytes: bytes, sections: dict, requirements: dict | None = None) -> dict:
     """공고에 첨부된 실제 .docx 신청서 양식을 받아, 그 문서 안의 항목(제목/라벨/표의 값 칸)
     자리에 AI가 작성한 해당 섹션 내용을 직접 삽입한다. build_docx()처럼 새 문서를 만드는
     대신, 원본 양식의 서식(표, 안내문 등)을 그대로 보존한 채 내용만 끼워 넣는 것이 목적이다.
@@ -827,6 +1048,7 @@ def fill_docx_template(template_bytes: bytes, sections: dict) -> dict:
     """
     doc = Document(io.BytesIO(template_bytes))
     targets = _collect_fill_targets(doc)
+    sections = _expand_fields(sections, requirements)
 
     mapping = {}
     if targets and sections:
@@ -861,15 +1083,9 @@ def fill_docx_template(template_bytes: bytes, sections: dict) -> dict:
         target = targets[idx]
         matched.append({"section": name, "target_label": target["label"]})
         if target["kind"] == "table_cell":
-            _append_lines_to_cell(target["ref"], text, comments)
+            _append_lines_to_cell(target["ref"], _as_cell_text(text), comments)
         else:
-            insert_after = target["ref"]
-            for line in (text or "").split("\n"):
-                if not line.strip():
-                    continue
-                new_p = _insert_paragraph_after(insert_after)
-                _add_body_text(new_p, line, comments)
-                insert_after = new_p
+            _insert_blocks_after(doc, target["ref"], text, comments)
 
     if unmatched:
         doc.add_paragraph()
@@ -885,10 +1101,7 @@ def fill_docx_template(template_bytes: bytes, sections: dict) -> dict:
             heading_run = heading_p.add_run(name)
             heading_run.bold = True
             heading_run.font.color.rgb = DOCX_NAVY
-            for line in (sections.get(name) or "").split("\n"):
-                if line.strip():
-                    body_p = doc.add_paragraph()
-                    _add_body_text(body_p, line, comments)
+            _add_blocks(doc, sections.get(name) or "", comments)
 
     _attach_comments(doc, comments)
 
