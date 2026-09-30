@@ -46,7 +46,7 @@ REQUIREMENTS_PROMPT_TEMPLATE = """
 [공고문 내용]
 {announcement_text}
 
-[신청서 양식 원문 (없으면 "(없음)")]
+[붙임·신청서 양식 원문 (공고문 붙임, 별도 신청서 파일 등 / 없으면 "(없음)")]
 {form_text}
 
 [추출할 JSON 스키마]
@@ -165,6 +165,77 @@ def _parse_json_response(response) -> dict:
     return parsed if isinstance(parsed, dict) else {}
 
 
+# 공고문 본문과 붙임(신청서·사업계획서 양식, 평가표 등)을 자르지 않고 넘길 수 있는 한도.
+# 예전에는 각 6,000자로 잘라서, 공고문 끝의 붙임에 있는 양식이 통째로 빠지곤 했다.
+MAX_ANNOUNCEMENT_CHARS = 30000
+MAX_FORM_CHARS = 50000
+
+# 첨부파일 이름으로 신청서·양식 파일을 알아본다 ("공고문"은 제외)
+_FORM_FILENAME = re.compile(r"신청서|서식|양식|계획서|붙임|별지|별첨|제출\s*서류|신청\s*서류|첨부\s*\d")
+# 공고문 안에서 붙임이 시작되는 줄 (예: "【붙임 1】", "[별지 제1호 서식]", "<붙임2>")
+_APPENDIX_LINE = re.compile(r"^\s*[\[【<(〔「]?\s*(붙임|별첨|별지|서식|첨부)\s*(제?\s*\d+\s*호?)?\s*(서식)?\s*[\]】>)〕」]?")
+# 같은 문서를 형식만 달리해 올린 경우 표 구조가 살아 있는 형식을 먼저 쓴다
+_FORMAT_PREFERENCE = {"hwpx": 0, "hwp": 1, "docx": 2, "pdf": 3, "doc": 4}
+
+
+def split_appendix(text: str) -> tuple[str, str]:
+    """공고문 텍스트를 본문과 붙임(양식·평가표 등)으로 나눈다. 붙임이 없으면 (전체, "")."""
+    offset = 0
+    min_offset = len(text) // 4  # 본문 앞쪽의 "붙임 1 참조" 같은 언급에서 잘리지 않도록
+    for line in text.splitlines(keepends=True):
+        if offset >= min_offset and len(line.strip()) <= 60 and _APPENDIX_LINE.match(line):
+            return text[:offset].rstrip(), text[offset:].strip()
+        offset += len(line)
+    return text, ""
+
+
+def load_announcement_sources(attachments: list[dict], fetch) -> dict:
+    """공고 첨부파일을 모두 읽어 본문과 양식으로 나눈다.
+
+    fetch: (url, filename) -> (text, images) (parser.fetch_attachment)
+    반환: {"body": 공고문 본문, "form": 붙임·신청서 양식, "images": 스캔본 페이지 이미지,
+           "files": [{"filename", "chars", "role"}], "errors": [...]}
+    """
+    by_stem = {}
+    for a in attachments or []:
+        if not a.get("url"):
+            continue
+        name = a.get("filename") or ""
+        stem, _, ext = name.rpartition(".")
+        stem = stem or name
+        rank = _FORMAT_PREFERENCE.get(ext.lower(), 9)
+        if stem not in by_stem or rank < by_stem[stem][0]:
+            by_stem[stem] = (rank, a)
+
+    result = {"body": [], "form": [], "images": [], "files": [], "errors": []}
+    for _, a in by_stem.values():
+        name = a.get("filename") or "첨부파일"
+        try:
+            text, images = fetch(a["url"], name)
+        except Exception as e:
+            result["errors"].append(f"{name}: {e}")
+            continue
+        result["images"].extend(images or [])
+        text = text or ""
+        if _FORM_FILENAME.search(name) and "공고" not in name:
+            result["form"].append(f"[{name}]\n{text}")
+            result["files"].append({"filename": name, "chars": len(text), "role": "양식"})
+            continue
+        body, appendix = split_appendix(text)
+        result["body"].append(f"[{name}]\n{body}")
+        if appendix:
+            result["form"].append(f"[{name} - 붙임]\n{appendix}")
+        result["files"].append({
+            "filename": name, "chars": len(text),
+            "role": f"공고문 + 붙임 {len(appendix):,}자" if appendix else "공고문",
+        })
+    result["body"] = "\n\n".join(result["body"])
+    result["form"] = "\n\n".join(result["form"])
+    # 이미지 여러 장을 한꺼번에 Vision 분석에 넣으면 비용/시간이 커지므로 총 개수를 제한한다
+    result["images"] = result["images"][:10]
+    return result
+
+
 def extract_application_requirements(
     announcement_text: str = "",
     form_text: str = "",
@@ -172,8 +243,8 @@ def extract_application_requirements(
     form_images: list | None = None,
 ) -> dict:
     prompt = REQUIREMENTS_PROMPT_TEMPLATE.format(
-        announcement_text=(announcement_text or "")[:6000] or "(없음)",
-        form_text=(form_text or "")[:6000] or "(없음)",
+        announcement_text=(announcement_text or "")[:MAX_ANNOUNCEMENT_CHARS] or "(없음)",
+        form_text=(form_text or "")[:MAX_FORM_CHARS] or "(없음)",
     )
     images = (announcement_images or []) + (form_images or [])
     contents = [prompt] + images if images else prompt

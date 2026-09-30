@@ -272,30 +272,21 @@ def render_requirements_step():
         [{"filename": ann.get("attachment_filename"), "url": ann.get("attachment_url")}]
         if ann.get("attachment_url") else []
     )
-    if ann_attachments and st.session_state.aw_ann_attachment is None:
-        with st.container(horizontal=True, vertical_alignment="center"):
-            st.caption(
-                f"공고 첨부파일 {len(ann_attachments)}건을 내려받아 분석에 포함할 수 있습니다 "
-                "(PDF·HWP/HWPX 텍스트 추출, 스캔본은 AI가 페이지 이미지를 직접 읽음)."
-            )
-            load_attachments = st.button("첨부파일 불러오기", icon=":material/attach_file:")
-        if load_attachments:
-            with st.spinner(f"첨부파일 {len(ann_attachments)}건을 내려받아 분석하는 중..."):
-                combined_text, combined_images = [], []
-                for a in ann_attachments:
-                    if not a.get("url"):
-                        continue
-                    try:
-                        text, images = parser.fetch_attachment(a["url"], a.get("filename") or "")
-                        if text:
-                            combined_text.append(f"[{a.get('filename') or '첨부파일'}]\n{text}")
-                        combined_images.extend(images)
-                    except Exception as e:
-                        st.warning(f"'{a.get('filename') or a['url']}' 처리 중 오류: {e}")
-                # 이미지 여러 개를 한꺼번에 Vision 분석에 넣으면 비용/시간이 커지므로 총 개수를 제한한다.
-                st.session_state.aw_ann_attachment = ("\n\n".join(combined_text), combined_images[:10])
-    elif st.session_state.aw_ann_attachment is not None:
-        st.caption(":material/check: 공고 첨부파일을 분석에 포함합니다.")
+    sources = st.session_state.aw_ann_attachment
+    if sources:
+        st.caption(
+            ":material/check: 읽은 첨부파일: "
+            + ", ".join(f"{f['filename']} ({f['role']})" for f in sources["files"])
+        )
+        for err in sources["errors"]:
+            st.caption(f":orange[:material/warning: {err}]")
+        if not sources["form"]:
+            st.caption(":orange[첨부파일에서 신청서 양식을 찾지 못했습니다. 양식 파일이 따로 있으면 아래에 올려 주세요.]")
+    elif ann_attachments:
+        st.caption(
+            f"분석할 때 공고 첨부파일 {len(ann_attachments)}건을 모두 읽어, 공고문 본문과 붙임(신청서·사업계획서 양식, "
+            "평가표)을 나눠 AI에 넘깁니다."
+        )
 
     uploaded_form = st.file_uploader(
         "신청서 양식이 별도 파일로 있다면 올려 주세요 (PDF/HWP/HWPX/Word)",
@@ -312,19 +303,20 @@ def render_requirements_step():
 
     if st.button("AI로 요건 분석" if not requirements else "요건 다시 분석", type="primary" if not requirements else "secondary",
                  icon=":material/auto_awesome:"):
-        announcement_text = ann.get("content") or ""
-        announcement_images = []
-        if st.session_state.aw_ann_attachment:
-            att_text, att_images = st.session_state.aw_ann_attachment
-            if att_text:
-                announcement_text = f"{announcement_text}\n\n[첨부 공고문 원문]\n{att_text}"
-            announcement_images = att_images
+        if ann_attachments and st.session_state.aw_ann_attachment is None:
+            with st.spinner(f"첨부파일 {len(ann_attachments)}건을 내려받아 읽는 중..."):
+                st.session_state.aw_ann_attachment = application_writer.load_announcement_sources(
+                    ann_attachments, parser.fetch_attachment
+                )
+        sources = st.session_state.aw_ann_attachment or {}
+        announcement_text = "\n\n".join(x for x in (ann.get("content") or "", sources.get("body") or "") if x)
+        form_text = "\n\n".join(x for x in (st.session_state.aw_form_text, sources.get("form") or "") if x)
         with st.spinner("AI가 공고문과 신청서 양식을 분석하는 중..."):
             try:
                 st.session_state.aw_requirements = application_writer.extract_application_requirements(
                     announcement_text=announcement_text,
-                    form_text=st.session_state.aw_form_text,
-                    announcement_images=announcement_images,
+                    form_text=form_text,
+                    announcement_images=sources.get("images") or [],
                     form_images=st.session_state.aw_form_images,
                 )
             except Exception as e:

@@ -97,7 +97,7 @@ PROMPT_TEMPLATE = """
 
 def fetch_attachment(url: str, filename: str = ""):
     """공고 첨부파일(공고문 원문)을 다운로드해 텍스트/이미지를 추출한다.
-    PDF는 텍스트/이미지 모두 반환 가능하고, HWP/HWPX는 미리보기 텍스트를 반환한다.
+    PDF는 텍스트/이미지 모두 반환 가능하고, HWP/HWPX는 본문 텍스트를 반환한다.
     다운로드나 파싱에 실패해도 전체 파싱 흐름을 막지 않도록 조용히 실패한다."""
     name = filename.lower()
 
@@ -118,7 +118,7 @@ def fetch_attachment(url: str, filename: str = ""):
     if name.endswith(".hwp") or name.endswith(".hwpx"):
         text = extract_hwp_text(resp.content)
         if not text:
-            print(f"  └ ⚠️ 한글 문서에서 미리보기 텍스트를 찾지 못했습니다 ({filename})")
+            print(f"  └ ⚠️ 한글 문서에서 텍스트를 찾지 못했습니다 ({filename})")
         return text, []
 
     if name.endswith(".docx"):
