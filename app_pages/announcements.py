@@ -3,7 +3,6 @@ import streamlit as st
 import matcher
 from ui_helpers import render_field, render_field_grid
 
-st.set_page_config(page_title="지원사업 공고 DB", page_icon="📋")
 st.title("📋 지원사업 공고 DB")
 st.caption("기업마당 API로 수집·분석된 정부 지원사업 공고 전체 목록 — 열 때마다 Supabase를 직접 조회하는 라이브 화면입니다.")
 

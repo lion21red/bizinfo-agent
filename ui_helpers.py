@@ -1,6 +1,8 @@
 """여러 Streamlit 페이지에서 공유하는 순수 렌더링 헬퍼 (Streamlit UI 코드는 없음).
-app.py를 직접 import하면 메인 화면 전체가 함께 실행되어 버리므로, 공용으로 쓸
+페이지 파일을 직접 import하면 그 화면 전체가 함께 실행되어 버리므로, 공용으로 쓸
 렌더링 함수는 이 모듈에 따로 둔다."""
+
+from datetime import date
 
 import streamlit as st
 
@@ -38,3 +40,13 @@ def render_field_grid(fields: list[tuple[str, str]]):
         f'gap:10px 16px;margin:6px 0 14px;">{items}</div>',
         unsafe_allow_html=True,
     )
+
+
+def deadline_label(end_date: str | None) -> str:
+    if not end_date:
+        return "상시/미정"
+    try:
+        days = (date.fromisoformat(end_date) - date.today()).days
+    except ValueError:
+        return end_date
+    return f"{end_date} (D-{days})" if days > 0 else f"{end_date} (오늘 마감)" if days == 0 else end_date

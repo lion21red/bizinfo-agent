@@ -2,7 +2,6 @@ import streamlit as st
 
 import chatbot
 
-st.set_page_config(page_title="지원사업 챗봇", page_icon="💬")
 st.title("💬 지원사업 챗봇")
 st.caption(
     "활성 공고 + 마감된 아카이브 공고까지 포함해 자유롭게 질문하세요. "

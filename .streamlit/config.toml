@@ -1,0 +1,18 @@
+[theme]
+base = "light"
+primaryColor = "#1f4e8c"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f4f6f9"
+textColor = "#1f2328"
+borderColor = "#dde2e8"
+linkColor = "#1f4e8c"
+font = "'Noto Sans KR':https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&display=swap"
+baseRadius = "0.6rem"
+greenColor = "#1a7f37"
+blueColor = "#1f4e8c"
+orangeColor = "#bc4c00"
+redColor = "#cf222e"
+grayColor = "#6e7781"
+
+[theme.sidebar]
+backgroundColor = "#f4f6f9"

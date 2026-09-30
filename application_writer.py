@@ -1,7 +1,7 @@
 """AI 신청서(사업계획서) 작성 도우미 - 순수 로직 모듈 (Streamlit UI 코드 없음).
 공고문+신청서양식 분석 -> 항목별 초안 생성 -> 채팅으로 초안 수정 -> 저장/문서 출력까지
 지원한다. matcher.py/chatbot.py와 동일하게 Gemini 호출과 Supabase 접근만 담당하고,
-화면 렌더링은 pages/3_신청서작성.py에서 처리한다.
+화면 렌더링은 app_pages/application.py에서 처리한다.
 """
 
 import io

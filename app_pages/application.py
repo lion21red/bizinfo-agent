@@ -21,7 +21,6 @@ def _extract_uploaded_text(name: str, file_bytes: bytes) -> str:
         return extract_doc_text(file_bytes)
     return extract_hwp_text(file_bytes)
 
-st.set_page_config(page_title="AI 신청서 작성 도우미", page_icon="📝")
 st.title("📝 AI 신청서 작성 도우미")
 st.caption("선택한 공고에 대해 AI가 신청서 요건을 분석하고 초안을 작성합니다. 채팅으로 수정 요청도 가능합니다.")
 
@@ -71,6 +70,10 @@ for key, default in {
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
+
+# 사이드바에서 고른 현재 기업을 기본으로 쓴다 (기업을 바꾸면 app.py가 aw_company_profile도 함께 바꿈)
+if not st.session_state.aw_company_profile and st.session_state.get("profile"):
+    st.session_state.aw_company_profile = st.session_state.profile
 
 with st.expander("📂 저장된 초안 불러오기 (이어서 작성)"):
     st.caption(
@@ -127,7 +130,7 @@ if st.session_state.aw_pending_updates:
         st.session_state[_section_key(_name)] = _text
     st.session_state.aw_pending_updates = None
 
-# app.py 매칭 결과에서 "이 공고로 신청서 작성"을 눌러 넘어온 경우, 새 공고로 갱신.
+# 매칭 화면(app_pages/matching.py) 결과에서 "이 공고로 신청서 작성"을 눌러 넘어온 경우, 새 공고로 갱신.
 # 한 번 반영한 뒤에는 반드시 pop으로 소비해야 한다 - 그대로 두면 "다른 공고 선택"으로
 # 초기화해도 다음 rerun에서 곧바로 같은 공고가 재적용되어 버튼이 동작하지 않게 된다.
 incoming = st.session_state.pop("selected_announcement", None)
@@ -157,7 +160,7 @@ if st.session_state.aw_announcement:
         if st.button("🔄 다른 공고 선택"):
             st.session_state.aw_announcement = None
             _reset_downstream_state()
-            st.switch_page("app.py")
+            st.switch_page("app_pages/matching.py")
 else:
     tab_search, tab_manual = st.tabs(["🔍 공고 검색", "✏️ 직접 입력"])
 
@@ -284,8 +287,8 @@ if requirements:
     st.subheader("3. 준비자료 입력")
 
     st.caption(
-        "매칭 도우미(app.py)에서 '이 공고로 신청서 작성'으로 넘어온 경우 회사 정보가 이미 채워져 있습니다. "
-        "이 화면에 바로 들어왔거나, 다른 저장된 기업으로 바꾸고 싶을 때만 아래에서 불러오세요."
+        "사이드바에서 고른 현재 기업 정보가 자동으로 쓰입니다. "
+        "초안만 다른 저장된 기업으로 작성하고 싶을 때 아래에서 불러오세요."
     )
     with st.expander("💾 저장된 기업 불러오기"):
         try:
@@ -306,7 +309,7 @@ if requirements:
                     st.session_state["aw_extra_text_input"] = selected_company["detail_notes"]
                 st.rerun()
         else:
-            st.caption("저장된 기업이 없습니다. 매칭 도우미(app.py)에서 먼저 기업 정보를 저장해 주세요.")
+            st.caption("저장된 기업이 없습니다. 지원사업 매칭 화면에서 먼저 기업 정보를 저장해 주세요.")
 
     if st.session_state.aw_company_profile:
         st.caption(f"현재 선택된 기업: **{st.session_state.aw_company_profile.get('company_name') or '(미상)'}**")
