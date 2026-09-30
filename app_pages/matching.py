@@ -9,6 +9,7 @@ from datetime import date
 
 import streamlit as st
 
+import announcement_ui as ui
 import company_profile as cp
 import ksic
 import matcher
@@ -28,27 +29,6 @@ for key, default in (("web_search_result", None), ("web_search_sources", None)):
 
 # ---------------------------------------------------------------- 표시용 헬퍼
 
-def _days_left(end_date: str | None) -> int | None:
-    try:
-        return (date.fromisoformat(end_date) - date.today()).days if end_date else None
-    except ValueError:
-        return None
-
-
-def _closing_soon(r: dict, days: int = 7) -> bool:
-    left = _days_left(r.get("end_date"))
-    return left is not None and 0 <= left <= days
-
-
-def _money(won) -> str:
-    won = int(won or 0)
-    if won >= 100_000_000:
-        return f"{won / 100_000_000:.1f}억".replace(".0억", "억")
-    if won >= 10_000:
-        return f"{won // 10_000:,}만"
-    return f"{won:,}"
-
-
 def _company_meta(p: dict) -> str:
     parts = [p.get("region"), p.get("industry")]
     if p.get("is_pre_founder"):
@@ -58,7 +38,7 @@ def _company_meta(p: dict) -> str:
         if age is not None:
             parts.append(f"업력 {age:.1f}년")
     if p.get("annual_revenue"):
-        parts.append(f"매출 {_money(p['annual_revenue'])}원")
+        parts.append(f"매출 {ui.money(p['annual_revenue'])}원")
     if p.get("employee_count"):
         parts.append(f"직원 {int(p['employee_count'])}명")
     return " · ".join(str(x) for x in parts if x)
@@ -95,19 +75,6 @@ def _missing_fields(p: dict) -> list[str]:
 
 def _score_color(score: int) -> str:
     return "#1a7f37" if score >= 70 else "#0969da" if score >= 50 else "#6e7781"
-
-
-def _types_text(r: dict) -> str:
-    types = (r.get("parsed_data") or {}).get("support_types")
-    return "·".join(types) if types else (r.get("category") or "분야 미상")
-
-
-def _go_apply(r: dict):
-    st.session_state.selected_announcement = {
-        k: r.get(k) for k in ("title", "department", "detail_url", "content", "attachment_url", "attachment_filename", "attachments")
-    }
-    st.session_state.selected_company_profile = st.session_state.profile
-    st.switch_page("app_pages/application.py")
 
 
 # ---------------------------------------------------------------- 기업 정보 가져오기
@@ -341,48 +308,9 @@ def edit_dialog():
 
 # ---------------------------------------------------------------- 공고 상세
 
-def _condition_fields(r: dict) -> list[tuple[str, str]]:
-    """공고의 자격 조건 중 실제로 제한이 있는 항목만."""
-    p = r.get("parsed_data") or {}
-    fields = []
-    if p.get("min_years") or p.get("max_years"):
-        fields.append(("업력", f"{p.get('min_years') or 0}~{p.get('max_years') or ''}년"))
-    if p.get("min_revenue") or p.get("max_revenue"):
-        lo = f"{_money(p['min_revenue'])}원 이상" if p.get("min_revenue") else ""
-        hi = f"{_money(p['max_revenue'])}원 이하" if p.get("max_revenue") else ""
-        fields.append(("매출액", " ".join(x for x in (lo, hi) if x)))
-    if p.get("max_employees"):
-        fields.append(("상시근로자", f"{p['max_employees']}명 이하"))
-    if p.get("min_ceo_age") or p.get("max_ceo_age"):
-        fields.append(("대표자 나이", f"{p.get('min_ceo_age') or ''}~{p.get('max_ceo_age') or ''}세"))
-    locations = [x for x in p.get("location_limit") or [] if x != "전국"]
-    if locations:
-        fields.append(("지역", ", ".join(locations)))
-    if p.get("industry_sections"):
-        fields.append(("업종", ksic.section_names(p["industry_sections"])))
-    for key, label in (("business_entity_limit", "기업 형태"), ("org_type_limit", "조직 형태")):
-        if p.get(key):
-            fields.append((label, ", ".join(p[key])))
-    if p.get("applicant_stage") in ("예비창업자", "기존사업자"):
-        fields.append(("신청 단계", f"{p['applicant_stage']}만"))
-    for key, label in (
-        ("requires_export_experience", "수출실적 필요"), ("requires_female_owned", "여성기업만"),
-        ("requires_disabled_owned", "장애인기업만"),
-    ):
-        if p.get(key):
-            fields.append(("필수 요건", label))
-    return fields
-
-
-def _bullets(items: list[str]):
-    st.markdown("\n".join(f"- {t}" for t in items) if items else "공고에 명시되지 않았습니다.")
-
-
 @st.dialog("공고 상세", width="large", icon=":material/description:")
 def detail_dialog(r: dict):
-    p = r.get("parsed_data") or {}
-    st.markdown(f"#### {r['title']}")
-    st.caption(f"{r.get('department') or '기관 미상'} · {_types_text(r)} · 마감 {deadline_label(r.get('end_date'))}")
+    ui.render_detail_header(r)
 
     if r.get("relevance") is not None:
         st.info(f"**AI 관련도 {r['relevance']}/10** — {r.get('relevance_reason') or ''}", icon=":material/auto_awesome:")
@@ -397,41 +325,7 @@ def detail_dialog(r: dict):
             col.progress(components[k] / weight, text=f"{matcher.SCORE_LABELS[k]} {components[k]}/{weight}")
         st.caption(r.get("reason") or "")
 
-    render_field_grid(
-        _condition_fields(r)
-        + [
-            ("신청 기간", f"{r.get('apply_start_date') or '미정'} ~ {r.get('end_date') or '상시/미정'}"),
-            ("최대 지원금", f"{_money(r['max_grant'])}원" if r.get("max_grant") else "명시 안 됨"),
-        ]
-    )
-    if p.get("target_summary"):
-        st.markdown(f"**대상** {p['target_summary']}")
-
-    tab_support, tab_eligible, tab_ineligible, tab_content = st.tabs(["지원 내용", "신청 자격", "제외 대상", "공고 원문 요약"])
-    with tab_support:
-        _bullets(p.get("support_details") or [])
-    with tab_eligible:
-        _bullets(p.get("eligible_targets") or [])
-    with tab_ineligible:
-        st.caption("업종 제외와 예비창업자/기존사업자 구분은 매칭에 반영했습니다. 체납·휴폐업·참여제한·중복수혜 등은 신청 전 직접 확인하세요.")
-        _bullets(p.get("ineligible_targets") or [])
-    with tab_content:
-        st.caption(r.get("content") or "원문 요약이 없습니다.")
-
-    with st.container(horizontal=True):
-        if r.get("detail_url"):
-            st.link_button("공고 원문", r["detail_url"], icon=":material/open_in_new:")
-        attachments = r.get("attachments") or (
-            [{"url": r["attachment_url"], "filename": r.get("attachment_filename")}] if r.get("attachment_url") else []
-        )
-        for a in attachments[:3]:
-            if a.get("url"):
-                name = a.get("filename") or "첨부파일"
-                # 긴 파일명은 가운데를 줄여서 확장자(pdf·hwp)가 보이게 한다
-                label = name if len(name) <= 30 else f"{name[:20]}…{name[-8:]}"
-                st.link_button(label, a["url"], icon=":material/attach_file:")
-        if st.button("이 공고로 신청서 작성", type="primary", icon=":material/edit_document:"):
-            _go_apply(r)
+    ui.render_detail_body(r)
 
 
 # ---------------------------------------------------------------- 매칭 실행
@@ -487,14 +381,13 @@ def render_card(r: dict):
                 badges.append(":green-badge[:material/verified: 맞춤]")
             if r.get("need_match"):
                 badges.append(":blue-badge[필요사항 일치]")
-            days = _days_left(r.get("end_date"))
-            if _closing_soon(r):
-                badges.append(f":red-badge[:material/schedule: D-{days}]" if days else ":red-badge[오늘 마감]")
+            if ui.deadline_badge(r):
+                badges.append(ui.deadline_badge(r))
             if r.get("unverified"):
                 badges.append(f":orange-badge[확인 필요: {'·'.join(r['unverified'])}]")
             if r.get("relevance") is not None and r["relevance"] <= relevance.LOW_RELEVANCE:
                 badges.append(":gray-badge[관련도 낮음]")
-            meta = f"{r.get('department') or '기관 미상'} · {_types_text(r)} · 마감 {deadline_label(r.get('end_date'))}"
+            meta = f"{r.get('department') or '기관 미상'} · {ui.types_text(r)} · 마감 {deadline_label(r.get('end_date'))}"
             st.markdown(" ".join(badges + [f":gray[{meta}]"]))
             if r.get("relevance_reason"):
                 st.caption(f":material/auto_awesome: {r['relevance_reason']}")
@@ -502,7 +395,7 @@ def render_card(r: dict):
             if st.button("상세", key=f"detail_{r['id']}", icon=":material/open_in_full:", width="stretch"):
                 detail_dialog(r)
             if st.button("신청서", key=f"apply_{r['id']}", icon=":material/edit_document:", width="stretch"):
-                _go_apply(r)
+                ui.go_apply(r)
 
 
 def render_results(profile: dict):
@@ -517,7 +410,7 @@ def render_results(profile: dict):
               help="AI 관련도 8점 이상")
     k3.metric("필요사항 일치", f"{sum(1 for r in eligible_all if r.get('need_match'))}건" if has_needs else "-",
               border=True, help="필요사항을 입력하면 표시됩니다." if not has_needs else "필요 분야나 관심 키워드가 겹치는 공고")
-    closing_soon = sum(1 for r in eligible_all if _closing_soon(r))
+    closing_soon = sum(1 for r in eligible_all if ui.closing_soon(r))
     k4.metric("7일 내 마감", f"{closing_soon}건", border=True)
 
     type_counts = {}

@@ -1,12 +1,22 @@
+"""신청서 작성 화면: 공고 선택 -> 요건 분석 -> 초안 생성 -> 검토·수정 -> 저장·내보내기.
+
+위쪽에 대상 공고·기업을 보여 주는 요약 막대와 단계 표시를 두고, 끝난 단계는 한 줄로 접어서
+지금 할 단계가 화면 중심에 오게 한다. 기업은 사이드바의 현재 기업을 쓴다 (app.py 참고).
+"""
+
 import streamlit as st
 
+import announcement_ui as ui
 import application_writer
 import matcher
 import parser
-from pdf_utils import extract_pdf_content
+from docx_utils import extract_doc_text, extract_docx_text
 from hwp_utils import extract_hwp_text
-from docx_utils import extract_docx_text, extract_doc_text
+from pdf_utils import extract_pdf_content
 from ui_helpers import render_field_grid
+
+DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+STEPS = ["공고 선택", "요건 분석", "초안 생성", "검토·수정", "저장·내보내기"]
 
 
 def _extract_uploaded_text(name: str, file_bytes: bytes) -> str:
@@ -20,11 +30,6 @@ def _extract_uploaded_text(name: str, file_bytes: bytes) -> str:
     if name.endswith(".doc"):
         return extract_doc_text(file_bytes)
     return extract_hwp_text(file_bytes)
-
-st.title("📝 AI 신청서 작성 도우미")
-st.caption("선택한 공고에 대해 AI가 신청서 요건을 분석하고 초안을 작성합니다. 채팅으로 수정 요청도 가능합니다.")
-
-DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 
 def _section_key(name: str) -> str:
@@ -52,6 +57,12 @@ def _reset_downstream_state():
     st.session_state.aw_filled_docx_matched = None
 
 
+def _pick_announcement(ann: dict):
+    st.session_state.aw_announcement = ann
+    _reset_downstream_state()
+    st.rerun()
+
+
 for key, default in {
     "aw_announcement": None,
     "aw_company_profile": {},
@@ -75,52 +86,6 @@ for key, default in {
 if not st.session_state.aw_company_profile and st.session_state.get("profile"):
     st.session_state.aw_company_profile = st.session_state.profile
 
-with st.expander("📂 저장된 초안 불러오기 (이어서 작성)"):
-    st.caption(
-        "임시저장한 초안은 별도 만료기한 없이 DB에 계속 보관되며, 언제든 여기서 다시 불러올 수 있습니다."
-    )
-    try:
-        resumable_drafts = application_writer.load_saved_drafts()
-    except Exception as e:
-        resumable_drafts = []
-        st.caption(f"저장된 초안을 불러올 수 없습니다 ({e}).")
-    if resumable_drafts:
-        r_options = {
-            f"{d.get('announcement_title')} - {d.get('company_name') or '(기업 미상)'} "
-            f"({(d.get('updated_at') or '')[:16].replace('T', ' ')})": d
-            for d in resumable_drafts
-        }
-        r_label = st.selectbox("불러올 초안 선택", list(r_options.keys()), key="resume_draft_select")
-        if st.button("이 초안 이어쓰기", key="resume_draft_button"):
-            d = r_options[r_label]
-            st.session_state.aw_announcement = {
-                "title": d.get("announcement_title"),
-                "detail_url": d.get("announcement_detail_url"),
-                "content": "",
-                "department": None,
-                "attachment_url": None,
-                "attachment_filename": None,
-                "attachments": None,
-            }
-            st.session_state.aw_draft_id = d["id"]
-            st.session_state.aw_requirements = d.get("requirements") or {}
-            st.session_state.aw_draft_sections = d.get("draft_sections") or {}
-            st.session_state.aw_company_profile = d.get("company_profile") or {}
-            st.session_state.aw_extra_context = d.get("extra_context") or ""
-            st.session_state.aw_ann_attachment = None
-            st.session_state.aw_form_text = ""
-            st.session_state.aw_form_images = []
-            st.session_state.aw_draft_chat_history = []
-            st.session_state.aw_filled_docx = None
-            st.session_state.aw_filled_docx_name = None
-            st.session_state.aw_filled_docx_matched = None
-            for name, text in st.session_state.aw_draft_sections.items():
-                st.session_state[_section_key(name)] = text
-            st.session_state["aw_extra_text_input"] = st.session_state.aw_extra_context
-            st.rerun()
-    else:
-        st.caption("저장된 초안이 없습니다.")
-
 # Streamlit은 위젯이 이미 그려진 뒤에는 같은 run 안에서 그 key의 session_state를 바로
 # 바꿀 수 없다. 그래서 채팅으로 받은 수정 결과는 여기 "대기열"에 잠깐 담아뒀다가, 아래
 # text_area들이 만들어지기 전인 지금(다음 run의 맨 앞) 반영한다.
@@ -130,264 +95,363 @@ if st.session_state.aw_pending_updates:
         st.session_state[_section_key(_name)] = _text
     st.session_state.aw_pending_updates = None
 
-# 매칭 화면(app_pages/matching.py) 결과에서 "이 공고로 신청서 작성"을 눌러 넘어온 경우, 새 공고로 갱신.
+# 매칭·공고 DB 화면에서 "신청서 작성"을 눌러 넘어온 경우, 새 공고로 갱신.
 # 한 번 반영한 뒤에는 반드시 pop으로 소비해야 한다 - 그대로 두면 "다른 공고 선택"으로
 # 초기화해도 다음 rerun에서 곧바로 같은 공고가 재적용되어 버튼이 동작하지 않게 된다.
 incoming = st.session_state.pop("selected_announcement", None)
 incoming_profile = st.session_state.pop("selected_company_profile", None)
 if incoming and (st.session_state.aw_announcement or {}).get("title") != incoming.get("title"):
     st.session_state.aw_announcement = incoming
-    st.session_state.aw_company_profile = incoming_profile or {}
+    if incoming_profile:
+        st.session_state.aw_company_profile = incoming_profile
     _reset_downstream_state()
 
-st.subheader("1. 대상 공고 선택")
 
-if st.session_state.aw_announcement:
-    ann = st.session_state.aw_announcement
-    with st.container(border=True):
-        st.markdown(f"**{ann.get('title') or '(제목 없음)'}**")
-        st.caption(f"{ann.get('department') or '기관 미상'}")
-        if ann.get("detail_url"):
-            st.markdown(f"[📎 공고 원문 바로가기]({ann['detail_url']})")
-        if ann.get("attachments"):
-            for a in ann["attachments"]:
-                if a.get("url"):
-                    st.markdown(f"[📄 {a.get('filename') or '첨부파일'}]({a['url']})")
-        elif ann.get("attachment_url"):
-            st.markdown(f"[📄 첨부파일 바로가기]({ann['attachment_url']})")
-            if ann.get("attachment_filename"):
-                st.caption(ann["attachment_filename"])
-        if st.button("🔄 다른 공고 선택"):
-            st.session_state.aw_announcement = None
-            _reset_downstream_state()
-            st.switch_page("app_pages/matching.py")
-else:
-    tab_search, tab_manual = st.tabs(["🔍 공고 검색", "✏️ 직접 입력"])
+@st.dialog("저장된 초안 불러오기", icon=":material/folder_open:")
+def drafts_dialog():
+    st.caption("임시저장한 초안은 만료 없이 보관됩니다. 불러오면 그때의 공고·기업·초안으로 이어서 작성합니다.")
+    try:
+        drafts = application_writer.load_saved_drafts()
+    except Exception as e:
+        st.error(f"초안을 불러오지 못했습니다: {e}")
+        return
+    if not drafts:
+        st.caption("저장된 초안이 없습니다.")
+        return
+    options = {
+        f"{d.get('announcement_title')} · {d.get('company_name') or '기업 미상'} "
+        f"({(d.get('updated_at') or '')[:16].replace('T', ' ')})": d
+        for d in drafts
+    }
+    label = st.selectbox("초안", list(options), label_visibility="collapsed")
+    if st.button("이어서 작성", type="primary", icon=":material/play_arrow:"):
+        d = options[label]
+        _reset_downstream_state()
+        st.session_state.aw_announcement = {
+            "title": d.get("announcement_title"),
+            "detail_url": d.get("announcement_detail_url"),
+            "content": "",
+            "department": None,
+            "attachment_url": None,
+            "attachment_filename": None,
+            "attachments": None,
+        }
+        st.session_state.aw_draft_id = d["id"]
+        st.session_state.aw_requirements = d.get("requirements") or {}
+        st.session_state.aw_draft_sections = d.get("draft_sections") or {}
+        st.session_state.aw_company_profile = d.get("company_profile") or {}
+        st.session_state.aw_extra_context = d.get("extra_context") or ""
+        for name, text in st.session_state.aw_draft_sections.items():
+            st.session_state[_section_key(name)] = text
+        st.session_state["aw_extra_text_input"] = st.session_state.aw_extra_context
+        st.rerun()
 
-    with tab_search:
-        keyword = st.text_input("제목/기관으로 검색", "", key="aw_search_keyword")
-        if keyword:
-            rows = (
-                matcher.supabase.table("announcements")
-                .select("title,department,detail_url,content,attachment_url,attachment_filename,attachments")
-                .or_(f"title.ilike.%{keyword}%,department.ilike.%{keyword}%")
-                .limit(10)
-                .execute()
-                .data
-            )
-            if not rows:
-                st.caption("검색 결과가 없습니다.")
-            for i, r in enumerate(rows):
-                with st.container(border=True):
-                    st.markdown(f"**{r.get('title')}**")
-                    st.caption(r.get("department") or "기관 미상")
-                    if st.button("이 공고 선택", key=f"aw_pick_{i}"):
-                        st.session_state.aw_announcement = r
-                        _reset_downstream_state()
-                        st.rerun()
 
-    with tab_manual:
-        m_title = st.text_input("공고명", key="aw_manual_title")
-        m_url = st.text_input("공고 원문 URL (선택)", key="aw_manual_url")
-        m_content = st.text_area("공고 내용 (붙여넣기)", height=150, key="aw_manual_content")
-        if st.button("이 정보로 시작", disabled=not m_title):
-            st.session_state.aw_announcement = {
-                "title": m_title,
-                "detail_url": m_url,
-                "content": m_content,
-                "department": None,
-                "attachment_url": None,
-                "attachment_filename": None,
-                "attachments": None,
-            }
-            _reset_downstream_state()
-            st.rerun()
+# ---------------------------------------------------------------- 상단: 요약 막대와 단계 표시
 
-if not st.session_state.aw_announcement:
-    st.stop()
+st.title("신청서 작성")
 
 ann = st.session_state.aw_announcement
-
-st.divider()
-st.subheader("2. 사전 준비 및 요건 분석")
-
-ann_attachments = ann.get("attachments") or (
-    [{"filename": ann.get("attachment_filename"), "url": ann.get("attachment_url")}]
-    if ann.get("attachment_url") else []
-)
-if ann_attachments and st.session_state.aw_ann_attachment is None:
-    st.caption(
-        f"이 공고의 첨부파일 {len(ann_attachments)}건을 모두 내려받아 분석에 포함합니다. "
-        "PDF는 텍스트를 추출하고(글자를 인식할 수 없는 스캔본은 페이지를 이미지로 바꿔 AI가 직접 읽습니다), "
-        "HWP/HWPX는 문서 안에 저장된 미리보기 텍스트를 추출합니다. 그 외 형식은 건너뜁니다."
-    )
-    if st.button("📎 공고 첨부파일 불러와 분석에 포함"):
-        with st.spinner(f"첨부파일 {len(ann_attachments)}건을 내려받아 분석하는 중..."):
-            combined_text, combined_images = [], []
-            for a in ann_attachments:
-                if not a.get("url"):
-                    continue
-                try:
-                    text, images = parser.fetch_attachment(a["url"], a.get("filename") or "")
-                    if text:
-                        combined_text.append(f"[{a.get('filename') or '첨부파일'}]\n{text}")
-                    combined_images.extend(images)
-                except Exception as e:
-                    st.warning(f"'{a.get('filename') or a['url']}' 처리 중 오류: {e}")
-            # 이미지 여러 개를 한꺼번에 Vision 분석에 넣으면 비용/시간이 커지므로 총 개수를 제한한다.
-            st.session_state.aw_ann_attachment = ("\n\n".join(combined_text), combined_images[:10])
-
-uploaded_form = st.file_uploader(
-    "신청서 양식 원문이 별도 파일로 있다면 업로드하세요 (PDF/HWP/HWPX/Word)",
-    type=["pdf", "hwp", "hwpx", "docx", "doc"],
-    key="aw_form_uploader",
-)
-if uploaded_form is not None:
-    file_bytes = uploaded_form.read()
-    if uploaded_form.name.lower().endswith(".pdf"):
-        st.session_state.aw_form_text, st.session_state.aw_form_images = extract_pdf_content(file_bytes)
-    else:
-        st.session_state.aw_form_text = _extract_uploaded_text(uploaded_form.name, file_bytes)
-        st.session_state.aw_form_images = []
-
-if st.button("🔍 AI로 요건 분석하기", type="primary"):
-    announcement_text = ann.get("content") or ""
-    announcement_images = []
-    if st.session_state.aw_ann_attachment:
-        att_text, att_images = st.session_state.aw_ann_attachment
-        if att_text:
-            announcement_text = f"{announcement_text}\n\n[첨부 공고문 원문]\n{att_text}"
-        announcement_images = att_images
-
-    with st.spinner("AI가 공고문/신청서 양식을 분석하는 중..."):
-        try:
-            st.session_state.aw_requirements = application_writer.extract_application_requirements(
-                announcement_text=announcement_text,
-                form_text=st.session_state.aw_form_text,
-                announcement_images=announcement_images,
-                form_images=st.session_state.aw_form_images,
-            )
-        except Exception as e:
-            st.error(f"분석 중 오류가 발생했습니다: {e}")
-
+company = st.session_state.aw_company_profile or {}
 requirements = st.session_state.aw_requirements
-if requirements:
-    st.markdown("**작성해야 할 항목**")
-    for s in requirements.get("form_sections") or []:
-        st.markdown(f"- **{s.get('section_name')}**: {s.get('guidance')}")
+has_draft = bool(st.session_state.aw_draft_sections)
 
-    render_field_grid(
-        [
+with st.container(border=True):
+    c_ann, c_company, c_actions = st.columns([5, 3, 2], vertical_alignment="center")
+    with c_ann:
+        st.caption("대상 공고")
+        if ann:
+            st.markdown(f"**{ann.get('title') or '(제목 없음)'}**")
+            links = []
+            if ann.get("detail_url"):
+                links.append(f"[공고 원문]({ann['detail_url']})")
+            for a in ann.get("attachments") or (
+                [{"url": ann["attachment_url"], "filename": ann.get("attachment_filename")}] if ann.get("attachment_url") else []
+            ):
+                if a.get("url"):
+                    links.append(f"[{a.get('filename') or '첨부파일'}]({a['url']})")
+            st.caption(" · ".join([ann.get("department") or "기관 미상"] + links))
+        else:
+            st.markdown(":gray[아직 고르지 않았습니다]")
+    with c_company:
+        st.caption("기업")
+        if company.get("company_name"):
+            st.markdown(f"**{company['company_name']}**")
+            sidebar_name = (st.session_state.get("profile") or {}).get("company_name")
+            st.caption(
+                "사이드바의 현재 기업입니다." if company["company_name"] == sidebar_name
+                else "불러온 초안·공고의 기업입니다. 사이드바에서 기업을 고르면 바뀝니다."
+            )
+        else:
+            st.markdown(":orange[선택된 기업이 없습니다]")
+            st.page_link("app_pages/matching.py", label="기업 고르러 가기", icon=":material/arrow_forward:")
+    with c_actions:
+        with st.container(horizontal=True, horizontal_alignment="right"):
+            if st.button("저장된 초안", icon=":material/folder_open:"):
+                drafts_dialog()
+            if ann and st.button("다른 공고", icon=":material/swap_horiz:"):
+                st.session_state.aw_announcement = None
+                _reset_downstream_state()
+                st.rerun()
+
+current_step = 0 if not ann else 1 if not requirements else 2 if not has_draft else 3
+step_badges = []
+for i, name in enumerate(STEPS):
+    label = f"{i + 1}. {name}"
+    if i < current_step:
+        step_badges.append(f":green-badge[:material/check: {label}]")
+    elif i == current_step or (current_step == 3 and i == 4):
+        step_badges.append(f":blue-badge[{label}]")
+    else:
+        step_badges.append(f":gray-badge[{label}]")
+st.markdown(" :gray[:material/chevron_right:] ".join(step_badges))
+
+
+# ---------------------------------------------------------------- 1. 공고 선택
+
+if not ann:
+    with st.container(border=True):
+        st.subheader("1. 공고 선택", anchor=False)
+        recommended = [r for r in (st.session_state.get("match_eligible") or []) if r.get("score", 0) >= 60][:10]
+        tab_names = (["매칭 추천"] if recommended else []) + ["공고 검색", "직접 입력"]
+        tabs = dict(zip(tab_names, st.tabs(tab_names)))
+
+        if recommended:
+            with tabs["매칭 추천"]:
+                st.caption("매칭 화면에서 점수가 높았던 공고입니다.")
+                for r in recommended:
+                    with st.container(border=True, horizontal=True, vertical_alignment="center"):
+                        st.markdown(f"**{r['score']}점** {r['title']}  \n:gray[{r.get('department') or '기관 미상'} · {ui.types_text(r)}]")
+                        if st.button("선택", key=f"aw_rec_{r['id']}"):
+                            _pick_announcement({k: r.get(k) for k in (
+                                "title", "department", "detail_url", "content", "attachment_url", "attachment_filename", "attachments"
+                            )})
+
+        with tabs["공고 검색"]:
+            keyword = st.text_input("검색", placeholder="제목·기관으로 검색", key="aw_search_keyword",
+                                    label_visibility="collapsed", icon=":material/search:")
+            if keyword:
+                rows = (
+                    matcher.supabase.table("announcements")
+                    .select("id,title,department,detail_url,content,attachment_url,attachment_filename,attachments")
+                    .or_(f"title.ilike.%{keyword}%,department.ilike.%{keyword}%")
+                    .order("id", desc=True)
+                    .limit(10)
+                    .execute()
+                    .data
+                )
+                if not rows:
+                    st.caption("검색 결과가 없습니다.")
+                for r in rows:
+                    with st.container(border=True, horizontal=True, vertical_alignment="center"):
+                        st.markdown(f"**{r.get('title')}**  \n:gray[{r.get('department') or '기관 미상'}]")
+                        if st.button("선택", key=f"aw_pick_{r['id']}"):
+                            _pick_announcement(r)
+
+        with tabs["직접 입력"]:
+            m_title = st.text_input("공고명", key="aw_manual_title")
+            m_url = st.text_input("공고 원문 URL (선택)", key="aw_manual_url")
+            m_content = st.text_area("공고 내용 (붙여넣기)", height=150, key="aw_manual_content")
+            if st.button("이 정보로 시작", disabled=not m_title, type="primary"):
+                _pick_announcement({
+                    "title": m_title,
+                    "detail_url": m_url,
+                    "content": m_content,
+                    "department": None,
+                    "attachment_url": None,
+                    "attachment_filename": None,
+                    "attachments": None,
+                })
+    st.stop()
+
+
+# ---------------------------------------------------------------- 2. 요건 분석
+
+def render_requirements_step():
+    ann_attachments = ann.get("attachments") or (
+        [{"filename": ann.get("attachment_filename"), "url": ann.get("attachment_url")}]
+        if ann.get("attachment_url") else []
+    )
+    if ann_attachments and st.session_state.aw_ann_attachment is None:
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.caption(
+                f"공고 첨부파일 {len(ann_attachments)}건을 내려받아 분석에 포함할 수 있습니다 "
+                "(PDF·HWP/HWPX 텍스트 추출, 스캔본은 AI가 페이지 이미지를 직접 읽음)."
+            )
+            load_attachments = st.button("첨부파일 불러오기", icon=":material/attach_file:")
+        if load_attachments:
+            with st.spinner(f"첨부파일 {len(ann_attachments)}건을 내려받아 분석하는 중..."):
+                combined_text, combined_images = [], []
+                for a in ann_attachments:
+                    if not a.get("url"):
+                        continue
+                    try:
+                        text, images = parser.fetch_attachment(a["url"], a.get("filename") or "")
+                        if text:
+                            combined_text.append(f"[{a.get('filename') or '첨부파일'}]\n{text}")
+                        combined_images.extend(images)
+                    except Exception as e:
+                        st.warning(f"'{a.get('filename') or a['url']}' 처리 중 오류: {e}")
+                # 이미지 여러 개를 한꺼번에 Vision 분석에 넣으면 비용/시간이 커지므로 총 개수를 제한한다.
+                st.session_state.aw_ann_attachment = ("\n\n".join(combined_text), combined_images[:10])
+    elif st.session_state.aw_ann_attachment is not None:
+        st.caption(":material/check: 공고 첨부파일을 분석에 포함합니다.")
+
+    uploaded_form = st.file_uploader(
+        "신청서 양식이 별도 파일로 있다면 올려 주세요 (PDF/HWP/HWPX/Word)",
+        type=["pdf", "hwp", "hwpx", "docx", "doc"],
+        key="aw_form_uploader",
+    )
+    if uploaded_form is not None:
+        file_bytes = uploaded_form.read()
+        if uploaded_form.name.lower().endswith(".pdf"):
+            st.session_state.aw_form_text, st.session_state.aw_form_images = extract_pdf_content(file_bytes)
+        else:
+            st.session_state.aw_form_text = _extract_uploaded_text(uploaded_form.name, file_bytes)
+            st.session_state.aw_form_images = []
+
+    if st.button("AI로 요건 분석" if not requirements else "요건 다시 분석", type="primary" if not requirements else "secondary",
+                 icon=":material/auto_awesome:"):
+        announcement_text = ann.get("content") or ""
+        announcement_images = []
+        if st.session_state.aw_ann_attachment:
+            att_text, att_images = st.session_state.aw_ann_attachment
+            if att_text:
+                announcement_text = f"{announcement_text}\n\n[첨부 공고문 원문]\n{att_text}"
+            announcement_images = att_images
+        with st.spinner("AI가 공고문과 신청서 양식을 분석하는 중..."):
+            try:
+                st.session_state.aw_requirements = application_writer.extract_application_requirements(
+                    announcement_text=announcement_text,
+                    form_text=st.session_state.aw_form_text,
+                    announcement_images=announcement_images,
+                    form_images=st.session_state.aw_form_images,
+                )
+            except Exception as e:
+                st.error(f"분석하지 못했습니다: {e}")
+                return
+        st.rerun()
+
+    if requirements:
+        st.markdown("**작성해야 할 항목**")
+        st.markdown("\n".join(f"- **{s.get('section_name')}**: {s.get('guidance')}" for s in requirements.get("form_sections") or []))
+        render_field_grid([
             ("심사 핵심요소", ", ".join(requirements.get("evaluation_criteria") or []) or "정보 없음"),
             ("준비 필요 서류", ", ".join(requirements.get("required_documents") or []) or "정보 없음"),
-        ]
-    )
+        ])
 
-    st.divider()
-    st.subheader("3. 준비자료 입력")
 
+if requirements:
+    n_sections = len(requirements.get("form_sections") or [])
+    with st.expander(f"2. 요건 분석 완료 — 작성 항목 {n_sections}개", icon=":material/check_circle:", expanded=not has_draft):
+        render_requirements_step()
+else:
+    with st.container(border=True):
+        st.subheader("2. 요건 분석", anchor=False)
+        st.caption("공고문과 신청서 양식을 AI가 읽고, 작성해야 할 항목과 심사 요소를 정리합니다.")
+        render_requirements_step()
+    st.stop()
+
+
+# ---------------------------------------------------------------- 3. 초안 생성
+
+def render_draft_step():
     st.caption(
-        "사이드바에서 고른 현재 기업 정보가 자동으로 쓰입니다. "
-        "초안만 다른 저장된 기업으로 작성하고 싶을 때 아래에서 불러오세요."
+        "기업 정보(회사 개요·필요사항 포함)는 자동으로 반영됩니다. 사업계획 초안이나 실적자료가 있으면 추가해 주세요."
     )
-    with st.expander("💾 저장된 기업 불러오기"):
-        try:
-            saved_companies = matcher.supabase.table("companies").select("*").order("created_at", desc=True).execute().data
-        except Exception as e:
-            saved_companies = []
-            st.caption(f"저장된 기업을 불러올 수 없습니다 ({e}).")
-        if saved_companies:
-            options = {f"{c['company_name']} ({c.get('region')})": c for c in saved_companies}
-            selected_label = st.selectbox("불러올 기업 선택", list(options.keys()), key="aw_company_select")
-            if st.button("이 기업 정보 사용"):
-                selected_company = options[selected_label]
-                st.session_state.aw_company_profile = selected_company
-                # 매칭 도우미에서 미리 정리해둔 회사 상세 메모가 있으면, 매번 서류를 다시
-                # 올리지 않아도 되도록 추가 자료의 기본값으로 자동 반영한다 (직접 입력한 내용은 덮지 않음).
-                if not st.session_state.aw_extra_context and selected_company.get("detail_notes"):
-                    st.session_state.aw_extra_context = selected_company["detail_notes"]
-                    st.session_state["aw_extra_text_input"] = selected_company["detail_notes"]
-                st.rerun()
-        else:
-            st.caption("저장된 기업이 없습니다. 지원사업 매칭 화면에서 먼저 기업 정보를 저장해 주세요.")
-
-    if st.session_state.aw_company_profile:
-        st.caption(f"현재 선택된 기업: **{st.session_state.aw_company_profile.get('company_name') or '(미상)'}**")
-    else:
-        st.caption("⚠️ 선택된 기업 정보가 없습니다. 위에서 불러오거나, 아래 추가 자료에 회사 정보를 직접 입력해 주세요.")
-
     extra_files = st.file_uploader(
-        "추가 준비자료 (사업계획 초안, 실적자료 등, PDF/HWP/HWPX/Word, 여러 개 가능)",
+        "추가 준비자료 (PDF/HWP/HWPX/Word, 여러 개 가능)",
         type=["pdf", "hwp", "hwpx", "docx", "doc"],
         accept_multiple_files=True,
         key="aw_extra_uploader",
     )
-    extra_text_input = st.text_area(
-        "추가로 반영하고 싶은 사업 내용/실적을 직접 입력하세요 (선택)",
-        height=120,
-        key="aw_extra_text_input",
-    )
+    extra_text_input = st.text_area("추가로 반영할 사업 내용·실적 (선택)", height=120, key="aw_extra_text_input")
 
-    if st.button("✍️ AI로 초안 생성하기", type="primary", disabled=not requirements.get("form_sections")):
+    label = "초안 다시 생성" if has_draft else "AI로 초안 생성"
+    if st.button(label, type="secondary" if has_draft else "primary", icon=":material/edit_note:",
+                 disabled=not requirements.get("form_sections"),
+                 help="다시 생성하면 지금까지 고친 초안을 덮어씁니다." if has_draft else None):
         extra_parts = [extra_text_input] if extra_text_input else []
         for f in extra_files or []:
-            fbytes = f.read()
-            text = _extract_uploaded_text(f.name, fbytes)
+            text = _extract_uploaded_text(f.name, f.read())
             if text:
                 extra_parts.append(f"[{f.name}]\n{text}")
         st.session_state.aw_extra_context = "\n\n".join(extra_parts)
-
         with st.spinner("AI가 신청서 초안을 작성하는 중..."):
             try:
                 drafted = application_writer.draft_application_sections(
                     st.session_state.aw_company_profile, st.session_state.aw_extra_context, requirements
                 )
-                st.session_state.aw_draft_sections = drafted
-                for name, text in drafted.items():
-                    st.session_state[_section_key(name)] = text
-                st.session_state.aw_draft_chat_history = []
             except Exception as e:
-                st.error(f"초안 생성 중 오류가 발생했습니다: {e}")
-
-if st.session_state.aw_draft_sections:
-    st.divider()
-    st.subheader("4. 초안 검토 및 수정")
-    st.caption("각 항목을 직접 수정하거나, 아래 채팅으로 AI에게 수정/추가를 요청할 수 있습니다.")
-
-    for name in st.session_state.aw_draft_sections.keys():
-        st.text_area(name, key=_section_key(name), height=180)
-
-    st.markdown("**🤖 AI와 협의하여 수정하기**")
-    for msg in st.session_state.aw_draft_chat_history:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-
-    chat_msg = st.chat_input("예: 추진계획에 3개월차 마일스톤 추가해줘 / 기대효과를 더 구체적으로 써줘")
-    if chat_msg:
-        st.session_state.aw_draft_chat_history.append({"role": "user", "content": chat_msg})
-        with st.spinner("AI가 반영하는 중..."):
-            try:
-                result = application_writer.refine_draft_via_chat(
-                    _current_sections(),
-                    requirements,
-                    st.session_state.aw_company_profile,
-                    st.session_state.aw_extra_context,
-                    st.session_state.aw_draft_chat_history[:-1],
-                    chat_msg,
-                )
-                st.session_state.aw_pending_updates = result["updated_sections"]
-                reply = result["reply"]
-            except Exception as e:
-                reply = f"요청 처리 중 오류가 발생했습니다: {e}"
-        st.session_state.aw_draft_chat_history.append({"role": "assistant", "content": reply})
+                st.error(f"초안을 만들지 못했습니다: {e}")
+                return
+        st.session_state.aw_draft_sections = drafted
+        for name, text in drafted.items():
+            st.session_state[_section_key(name)] = text
+        st.session_state.aw_draft_chat_history = []
         st.rerun()
 
-    st.divider()
-    st.subheader("5. 저장 및 다운로드")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("💾 임시저장"):
+if has_draft:
+    with st.expander("3. 초안 생성 완료 — 준비자료를 바꿔 다시 만들 수 있습니다", icon=":material/check_circle:"):
+        render_draft_step()
+else:
+    with st.container(border=True):
+        st.subheader("3. 초안 생성", anchor=False)
+        if not company.get("company_name"):
+            st.warning("선택된 기업이 없습니다. 사이드바에서 기업을 고르거나, 아래에 회사 정보를 직접 적어 주세요.",
+                       icon=":material/warning:")
+        render_draft_step()
+    st.stop()
+
+
+# ---------------------------------------------------------------- 4. 검토·수정
+
+st.subheader("4. 초안 검토·수정", anchor=False)
+c_draft, c_chat = st.columns([3, 2])
+
+with c_draft:
+    st.caption("각 항목을 직접 고치거나, 오른쪽에서 AI에게 수정을 요청하세요.")
+    for name in st.session_state.aw_draft_sections:
+        st.text_area(name, key=_section_key(name), height=200)
+
+with c_chat:
+    with st.container(border=True):
+        st.markdown("**:material/forum: AI와 함께 고치기**")
+        with st.container(height=460, border=False):
+            if not st.session_state.aw_draft_chat_history:
+                st.caption("예: 추진계획에 3개월차 마일스톤을 추가해 줘 / 기대효과를 수치로 더 구체적으로 써 줘")
+            for msg in st.session_state.aw_draft_chat_history:
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
+        chat_msg = st.chat_input("수정 요청을 입력하세요")
+
+if chat_msg:
+    st.session_state.aw_draft_chat_history.append({"role": "user", "content": chat_msg})
+    with st.spinner("AI가 반영하는 중..."):
+        try:
+            result = application_writer.refine_draft_via_chat(
+                _current_sections(),
+                requirements,
+                st.session_state.aw_company_profile,
+                st.session_state.aw_extra_context,
+                st.session_state.aw_draft_chat_history[:-1],
+                chat_msg,
+            )
+            st.session_state.aw_pending_updates = result["updated_sections"]
+            reply = result["reply"]
+        except Exception as e:
+            reply = f"요청을 처리하지 못했습니다: {e}"
+    st.session_state.aw_draft_chat_history.append({"role": "assistant", "content": reply})
+    st.rerun()
+
+
+# ---------------------------------------------------------------- 5. 저장·내보내기
+
+with st.container(border=True):
+    st.subheader("5. 저장·내보내기", anchor=False)
+    with st.container(horizontal=True):
+        if st.button("임시저장", icon=":material/save:"):
             try:
                 st.session_state.aw_draft_id = application_writer.save_draft(
                     st.session_state.aw_draft_id,
@@ -399,16 +463,15 @@ if st.session_state.aw_draft_sections:
                     st.session_state.aw_company_profile,
                     st.session_state.aw_extra_context,
                 )
-                st.success("저장되었습니다.")
+                st.toast("임시저장했습니다.", icon=":material/check:")
             except Exception as e:
-                st.error(f"저장 중 오류가 발생했습니다: {e}")
-    with col2:
-        docx_buf = application_writer.build_docx(ann, st.session_state.aw_company_profile, _current_sections())
+                st.error(f"저장하지 못했습니다: {e}")
         st.download_button(
-            "📥 신청서 초안 다운로드 (.docx)",
-            data=docx_buf,
+            "초안 다운로드 (.docx)",
+            data=application_writer.build_docx(ann, st.session_state.aw_company_profile, _current_sections()),
             file_name=f"{ann.get('title') or '신청서'}_초안.docx",
             mime=DOCX_MIME,
+            icon=":material/download:",
         )
 
     # 공고에 첨부된 파일 중 .docx 양식이 있으면, 새 문서를 만드는 대신 그 원본 양식
@@ -423,28 +486,39 @@ if st.session_state.aw_draft_sections:
         if a.get("url") and (a.get("filename") or "").lower().endswith(".docx")
     ]
 
-    st.divider()
-    st.markdown("**📝 신청서 양식(.docx)에 바로 채워넣기**")
-
+    st.markdown("**신청서 양식(.docx)에 바로 채워 넣기**")
     template_bytes = None
     template_name = None
+    selected_template = None
     if docx_attachments:
         if len(docx_attachments) == 1:
             selected_template = docx_attachments[0]
             st.caption(f"대상 양식: {selected_template.get('filename')}")
         else:
             template_options = {a["filename"]: a for a in docx_attachments}
-            template_label = st.selectbox("채워넣을 양식 파일 선택", list(template_options.keys()), key="aw_template_select")
+            template_label = st.selectbox("채워 넣을 양식 파일", list(template_options), key="aw_template_select")
             selected_template = template_options[template_label]
         template_name = selected_template.get("filename")
     else:
-        st.caption("이 공고의 첨부파일 중 .docx 형식 양식이 없습니다. 직접 가지고 있는 신청서 양식(.docx)을 업로드해 주세요.")
-        uploaded_template = st.file_uploader("신청서 양식 업로드 (.docx)", type=["docx"], key="aw_template_uploader")
+        st.caption("이 공고의 첨부파일에 .docx 양식이 없습니다. 가지고 있는 신청서 양식(.docx)을 올려 주세요.")
+        uploaded_template = st.file_uploader("신청서 양식 (.docx)", type=["docx"], key="aw_template_uploader")
         if uploaded_template is not None:
             template_bytes = uploaded_template.read()
             template_name = uploaded_template.name
 
-    if st.button("📝 이 양식에 채워넣기", disabled=not (docx_attachments or template_bytes)):
+    with st.container(horizontal=True):
+        fill_clicked = st.button("양식에 채워 넣기", icon=":material/edit_document:",
+                                 disabled=not (docx_attachments or template_bytes))
+        if st.session_state.aw_filled_docx:
+            st.download_button(
+                "채운 양식 다운로드",
+                data=st.session_state.aw_filled_docx,
+                file_name=f"채움_{st.session_state.aw_filled_docx_name}",
+                mime=DOCX_MIME,
+                icon=":material/download:",
+                type="primary",
+            )
+    if fill_clicked:
         with st.spinner("양식의 항목 위치를 찾고 내용을 채우는 중..."):
             try:
                 if template_bytes is None:
@@ -454,24 +528,21 @@ if st.session_state.aw_draft_sections:
                 st.session_state.aw_filled_docx_name = template_name
                 st.session_state.aw_filled_docx_matched = fill_result["matched"]
                 if fill_result["unmatched"]:
-                    st.warning(
-                        "다음 항목은 양식에서 알맞은 위치를 찾지 못해 문서 끝에 추가했습니다: "
-                        + ", ".join(fill_result["unmatched"])
+                    st.session_state.aw_fill_notice = (
+                        "다음 항목은 양식에서 알맞은 위치를 찾지 못해 문서 끝에 추가했습니다: " + ", ".join(fill_result["unmatched"])
                     )
                 else:
-                    st.success("양식의 모든 항목을 채웠습니다.")
+                    st.session_state.aw_fill_notice = None
+                st.rerun()
             except Exception as e:
-                st.error(f"양식 채우기 중 오류가 발생했습니다: {e}")
+                st.error(f"양식을 채우지 못했습니다: {e}")
 
     if st.session_state.aw_filled_docx:
-        st.download_button(
-            f"📥 채워진 {st.session_state.aw_filled_docx_name} 다운로드",
-            data=st.session_state.aw_filled_docx,
-            file_name=f"채움_{st.session_state.aw_filled_docx_name}",
-            mime=DOCX_MIME,
-        )
+        if st.session_state.get("aw_fill_notice"):
+            st.warning(st.session_state.aw_fill_notice, icon=":material/warning:")
         if st.session_state.aw_filled_docx_matched:
-            with st.expander("🔍 매칭 결과 확인 (문서를 열어보지 않고 위치가 맞는지 미리 확인)"):
-                for m in st.session_state.aw_filled_docx_matched:
-                    st.markdown(f"- **{m['section']}** → {m['target_label']}")
-                st.caption("위치가 잘못됐다면 다운로드한 문서에서 직접 옮기거나, 위 초안을 수정한 뒤 다시 채워넣기를 눌러 주세요.")
+            with st.expander("항목이 들어간 위치 확인", icon=":material/fact_check:"):
+                st.markdown("\n".join(
+                    f"- **{m['section']}** → {m['target_label']}" for m in st.session_state.aw_filled_docx_matched
+                ))
+                st.caption("위치가 잘못됐다면 다운로드한 문서에서 직접 옮기거나, 초안을 고친 뒤 다시 채워 넣으세요.")

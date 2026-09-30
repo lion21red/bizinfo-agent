@@ -2,7 +2,7 @@ import streamlit as st
 
 import chatbot
 
-st.title("💬 지원사업 챗봇")
+st.title("지원사업 챗봇")
 st.caption(
     "활성 공고 + 마감된 아카이브 공고까지 포함해 자유롭게 질문하세요. "
     "Supabase를 매번 직접 조회하므로 항상 최신 DB 기준으로 답변합니다."
