@@ -13,7 +13,6 @@ import parser
 from docx_utils import extract_doc_text, extract_docx_text
 from hwp_utils import extract_hwp_text
 from pdf_utils import extract_pdf_content
-from ui_helpers import render_field_grid
 
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 STEPS = ["공고 선택", "요건 분석", "초안 생성", "검토·수정", "저장·내보내기"]
@@ -325,12 +324,68 @@ def render_requirements_step():
         st.rerun()
 
     if requirements:
-        st.markdown("**작성해야 할 항목**")
-        st.markdown("\n".join(f"- **{s.get('section_name')}**: {s.get('guidance')}" for s in requirements.get("form_sections") or []))
-        render_field_grid([
-            ("심사 핵심요소", ", ".join(requirements.get("evaluation_criteria") or []) or "정보 없음"),
-            ("준비 필요 서류", ", ".join(requirements.get("required_documents") or []) or "정보 없음"),
-        ])
+        render_requirements(requirements)
+
+
+TYPE_BADGES = {"서술": ":blue-badge[서술]", "표": ":violet-badge[표]", "기재란": ":gray-badge[기재란]"}
+
+
+def _badge_text(text: str) -> str:
+    # 배지 문법 안에서는 대괄호를 쓸 수 없다
+    return text.replace("[", "(").replace("]", ")")
+
+
+def render_requirements(req: dict):
+    """요건 분석 결과: 작성 항목(양식 구조 그대로), 평가 기준, 제출 서류."""
+    sections = req.get("form_sections") or []
+    if req.get("form_found") is False:
+        st.warning(
+            "공고 첨부파일에서 신청서·사업계획서 양식을 찾지 못해, 공고 내용으로 **AI가 추정한 목차**입니다. "
+            "양식 파일이 있으면 위에 올리고 요건을 다시 분석하세요.",
+            icon=":material/warning:",
+        )
+    if req.get("form_title"):
+        st.markdown(f"**{req['form_title']}**")
+    if req.get("overall_limits"):
+        st.caption(f":material/straighten: {req['overall_limits']}")
+    if req.get("possibly_missing"):
+        st.warning(
+            "양식에 있는데 작성 항목으로 뽑히지 않은 제목이 있습니다. 필요하면 요건을 다시 분석하세요: "
+            + ", ".join(req["possibly_missing"]),
+            icon=":material/playlist_remove:",
+        )
+
+    criteria = req.get("evaluation_criteria") or []
+    documents = req.get("required_documents") or []
+    tab_sections, tab_criteria, tab_documents = st.tabs(
+        [f"작성 항목 {len(sections)}", f"평가 기준 {len(criteria)}", f"제출 서류 {len(documents)}"]
+    )
+    with tab_sections:
+        chapter = None
+        for s in sections:
+            if s.get("chapter") and s["chapter"] != chapter:
+                chapter = s["chapter"]
+                st.markdown(f"**{chapter}**")
+            badges = [TYPE_BADGES.get(s.get("type"), "")]
+            if s.get("source") == "추정":
+                badges.append(":orange-badge[AI 추정]")
+            if s.get("length_limit"):
+                badges.append(f":gray-badge[:material/straighten: {_badge_text(s['length_limit'])}]")
+            if s.get("evaluation"):
+                badges.append(f":green-badge[:material/grading: {_badge_text(s['evaluation'])}]")
+            with st.container(border=True, gap="small"):
+                st.markdown(f"**{s.get('section_name')}** " + " ".join(b for b in badges if b))
+                if s.get("form_guidance"):
+                    st.caption(f":material/description: **양식 작성요령** {s['form_guidance']}")
+                if s.get("guidance"):
+                    st.caption(f":material/lightbulb: {s['guidance']}")
+    with tab_criteria:
+        points = [c.get("points") for c in criteria if isinstance(c, dict) and isinstance(c.get("points"), (int, float))]
+        if points:
+            st.caption(f"배점 합계 {sum(points):g}점 (가점 포함)")
+        st.markdown("\n".join(f"- {application_writer.format_criterion(c)}" for c in criteria) or "공고에 명시되지 않았습니다.")
+    with tab_documents:
+        st.markdown("\n".join(f"- {d}" for d in documents) or "공고에 명시되지 않았습니다.")
 
 
 if requirements:

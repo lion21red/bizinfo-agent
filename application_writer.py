@@ -38,10 +38,29 @@ ANALYSIS_MODEL = "gemini-flash-lite-latest"
 WRITING_MODEL = "gemini-flash-latest"
 
 REQUIREMENTS_PROMPT_TEMPLATE = """
-당신은 대한민국 정부 지원사업 신청서 작성 컨설턴트입니다. 아래 공고문 및 신청서 양식 내용을 분석하여,
-신청서 작성 시 채워야 할 항목과 심사 시 중요하게 보는 핵심 요소, 준비해야 할 서류를 지정된 JSON
-형식으로 정리하세요. 신청서 양식 원문이 없거나 부실하면, 정부지원사업 신청서에 통상적으로 들어가는
-항목(사업 개요, 추진 배경/필요성, 추진 계획, 기대효과, 소요예산 등)을 공고 내용에 맞게 구성하세요.
+당신은 대한민국 정부 지원사업 신청서 작성 컨설턴트입니다. 아래 공고문과 붙임(신청서·사업계획서 양식,
+평가표, 제출서류 목록 등)을 분석해, 신청자가 양식에 채워야 할 항목을 양식 구조 그대로 정리하세요.
+
+[작성 항목(form_sections) 추출 규칙]
+1. 신청서·사업계획서 양식이 있으면 양식에 나온 순서와 번호, 제목을 그대로 따르세요. 제목을 합치거나
+   바꾸거나 새로 만들지 마세요.
+2. 번호가 붙은 가장 작은 작성 단위(절)마다 항목 하나로 나누세요. 예를 들어 "Ⅰ. 실증 사업 개요" 아래에
+   "1. 실증 사업 필요성", "2. 국내외 관련 동향 및 전망"이 있으면 항목은 두 개이고, "Ⅰ. 실증 사업 개요"는
+   chapter에만 적습니다. 아래에 절이 없는 장 제목은 그 자체가 항목입니다.
+3. 종류(type)를 구분하세요.
+   - "기재란": 표지·신청 정보처럼 기업명, 대표자, 사업비 등 칸을 채우는 표 (한 표를 항목 하나로)
+   - "표": 본문 안에서 표로 작성하는 부분 (성과지표표, 추진일정표, 참여인력표, 일반현황표 등). 절의 설명 글과
+     표가 함께 있으면 절 하나를 "서술"로 두고 표는 guidance에 적으세요. 표만 있는 절은 "표"입니다.
+   - "서술": 글로 작성하는 부분
+   요약문이 있으면 "요약문"을 항목 하나로 두세요.
+4. 작성 항목이 아닌 것은 넣지 마세요: 평가표, 제출서류 목록, 개인정보 동의서, 서약서·확약서, 목차.
+5. form_guidance에는 양식에 적힌 작성요령(예: "<작성내용 및 방법>", "※ ~ 기재" 안내문)을 원문 그대로
+   옮기세요. 없으면 빈 문자열. guidance에는 심사 기준을 고려해 무엇을 어떤 관점으로 쓰면 좋은지 조언하세요.
+6. length_limit에는 그 항목에만 걸린 분량 제한(예: "1쪽 이내")을 적으세요. 문서 전체에 걸린 제한(예: "본문
+   5쪽 이내")은 overall_limits에만 적고 항목마다 반복하지 마세요. evaluation에는 그 항목이 주로 영향을 주는
+   평가 항목과 배점(예: "기술의 실증 적합성 20점")을 적되, 뚜렷이 연결되는 평가 항목이 없으면 빈 문자열로 두세요.
+7. 신청서·사업계획서 양식을 찾을 수 없을 때만 form_found를 false로 하고, 공고 내용에 맞는 통상적인
+   항목을 구성해 각 항목의 source를 "추정"으로 표시하세요. 양식에서 가져온 항목의 source는 "양식"입니다.
 
 [공고문 내용]
 {announcement_text}
@@ -51,9 +70,22 @@ REQUIREMENTS_PROMPT_TEMPLATE = """
 
 [추출할 JSON 스키마]
 {{
-  "form_sections": [{{"section_name": "항목명", "guidance": "이 항목에 무엇을, 어떤 관점으로 써야 하는지 구체적 안내"}}],
-  "evaluation_criteria": ["심사/선정 시 중요하게 보는 핵심 요소"],
-  "required_documents": ["신청 시 제출이 필요한 준비서류 목록"]
+  "form_found": true,
+  "form_title": "양식 이름 (예: 2026년 ○○사업 사업계획서)",
+  "overall_limits": "문서 전체 분량·형식 제한 (예: 본문 5쪽 이내, 요약문 1쪽) / 없으면 빈 문자열",
+  "form_sections": [{{
+    "section_id": "양식 번호 (예: Ⅰ-1, 2-3) / 번호 없으면 빈 문자열",
+    "chapter": "상위 장 제목 (예: Ⅰ. 실증 사업 개요) / 없으면 빈 문자열",
+    "section_name": "양식의 항목 제목 그대로 (번호 제외)",
+    "type": "서술 | 표 | 기재란",
+    "form_guidance": "양식 작성요령 원문",
+    "guidance": "작성 조언",
+    "length_limit": "",
+    "evaluation": "",
+    "source": "양식 | 추정"
+  }}],
+  "evaluation_criteria": [{{"item": "평가 항목", "points": 배점 숫자 또는 null, "details": "세부 기준 요약"}}],
+  "required_documents": ["신청 시 제출이 필요한 서류 (발급처·조건 포함)"]
 }}
 """
 
@@ -71,6 +103,10 @@ DRAFT_PROMPT_TEMPLATE = """
   그 주변 서술(맥락, 방법론, 논리)은 최대한 구체적으로 채우세요.
 - 추진 계획류 항목은 월차/분기별 마일스톤처럼 시간 순서가 드러나게, 예산/기대효과류 항목은 항목별
   세부 내역이 드러나게 작성하세요.
+- 각 항목의 form_guidance(양식에 적힌 작성요령)를 빠짐없이 따르고, length_limit(분량 제한)가 있으면
+  지키세요. evaluation(연결된 평가 항목·배점)이 큰 항목일수록 더 구체적으로 쓰세요.
+- type이 "기재란"인 항목은 "칸 이름: 값" 형태의 줄로, "표"인 항목은 마크다운 표로 작성하세요. 이 두
+  종류에는 500자 기준을 적용하지 않습니다. 기업 정보에 있는 값은 채우고 없는 값은 [확인 필요]로 두세요.
 
 [기업 정보]
 {company_profile_json}
@@ -249,16 +285,97 @@ def extract_application_requirements(
     images = (announcement_images or []) + (form_images or [])
     contents = [prompt] + images if images else prompt
 
+    # 양식 구조를 그대로 옮기는 일이라 경량 모델보다 정확한 모델을 쓴다 (공고당 한 번 호출)
     response = ai_client.models.generate_content(
-        model=ANALYSIS_MODEL,
+        model=WRITING_MODEL,
         contents=contents,
         config={"response_mime_type": "application/json"},
     )
     parsed = _parse_json_response(response)
-    parsed.setdefault("form_sections", [])
+    parsed["form_sections"] = _normalize_sections(parsed.get("form_sections"))
     parsed.setdefault("evaluation_criteria", [])
     parsed.setdefault("required_documents", [])
+    parsed["form_found"] = bool(parsed.get("form_found", True)) and any(
+        s["source"] == "양식" for s in parsed["form_sections"]
+    )
+    parsed["possibly_missing"] = find_missing_headings(form_text or "", parsed["form_sections"])
     return parsed
+
+
+SECTION_TYPES = ("서술", "표", "기재란")
+_PRIVATE_USE = re.compile(r"[\ue000-\uf8ff\U000f0000-\U0010ffff]")
+
+
+def _normalize_sections(sections) -> list[dict]:
+    """AI가 돌려준 항목을 정리한다. 초안·양식 채우기가 항목 이름을 키로 쓰므로, 양식 번호를 붙여
+    이름을 고유하게 만든다 (예: "Ⅰ-1 실증 사업 필요성")."""
+    result, seen = [], set()
+    for s in sections or []:
+        if not isinstance(s, dict) or not str(s.get("section_name") or "").strip():
+            continue
+        section_id = str(s.get("section_id") or "").strip()
+        title = _PRIVATE_USE.sub("", str(s["section_name"])).strip()
+        name = f"{section_id} {title}" if section_id and not title.startswith(section_id) else title
+        base, n = name, 2
+        while name in seen:
+            name, n = f"{base} ({n})", n + 1
+        seen.add(name)
+        result.append({
+            "section_id": section_id,
+            "chapter": str(s.get("chapter") or "").strip(),
+            "section_name": name,
+            "type": s.get("type") if s.get("type") in SECTION_TYPES else "서술",
+            "form_guidance": str(s.get("form_guidance") or "").strip(),
+            "guidance": str(s.get("guidance") or "").strip(),
+            "length_limit": str(s.get("length_limit") or "").strip(),
+            "evaluation": str(s.get("evaluation") or "").strip(),
+            "source": "추정" if s.get("source") == "추정" else "양식",
+        })
+    return result
+
+
+_ROMAN_HEADING = re.compile(r"^\s*([ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ])\s*[.．]\s*(\S.*)$")
+_NUMBER_HEADING = re.compile(r"^\s*(\d{1,2})\s*[.．]\s*(\S.*)$")
+_NON_FORM_DOC = re.compile(r"동의서|서약서|확약서|각서|개인정보|비밀유지|약정서")
+
+
+def _norm(text: str) -> str:
+    return re.sub(r"[^0-9A-Za-z가-힣]", "", text)
+
+
+def find_missing_headings(form_text: str, sections: list[dict]) -> list[str]:
+    """양식에 "Ⅰ. 장 / 1. 절" 형태의 제목이 있는데 추출된 항목에 없는 것을 찾는다 (누락 의심).
+
+    목차 줄의 점선·쪽번호는 떼고 비교한다. 장 번호 체계가 없는 양식은 판단하지 않는다.
+    """
+    extracted = " ".join(_norm(s["section_name"] + s.get("chapter", "")) for s in sections)
+    headings, in_chapter = [], False
+    for line in form_text.splitlines():
+        line = re.sub(r"[·ㆍ.…\s]{3,}\d*\s*$", "", line).strip()
+        # 동의서·서약서 같은 다른 문서가 시작되면 그 안의 번호 목록은 작성 항목이 아니다
+        if _APPENDIX_LINE.match(line) or _NON_FORM_DOC.search(line):
+            in_chapter = False
+            continue
+        if _ROMAN_HEADING.match(line):
+            in_chapter = True
+            headings.append(line)
+        elif in_chapter and _NUMBER_HEADING.match(line) and len(line) <= 40 and "|" not in line:
+            headings.append(line)
+    missing = []
+    for h in headings:
+        title = _norm((_ROMAN_HEADING.match(h) or _NUMBER_HEADING.match(h)).group(2))
+        if title and title not in extracted and h not in missing:
+            missing.append(h)
+    return missing
+
+
+def format_criterion(c) -> str:
+    """평가 기준 한 줄 (예전 형식인 문자열과 새 형식인 {item, points, details} 모두 처리)."""
+    if isinstance(c, dict):
+        points = f" ({c['points']}점)" if c.get("points") not in (None, "") else ""
+        details = f": {c['details']}" if c.get("details") else ""
+        return f"{c.get('item') or ''}{points}{details}"
+    return str(c)
 
 
 def draft_application_sections(company_profile: dict, extra_context: str, requirements: dict) -> dict:

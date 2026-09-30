@@ -18,15 +18,19 @@ from xml.etree import ElementTree
 import olefile
 
 
+# 한글의 글머리표·특수기호는 유니코드 사용자 정의 영역 문자로 저장돼 다른 프로그램에서 깨져 보인다
+_PRIVATE_USE = re.compile(r"[\ue000-\uf8ff\U000f0000-\U0010ffff]")
+
+
 def extract_hwp_text(file_bytes: bytes) -> str:
     """HWP 또는 HWPX 바이트에서 본문 텍스트를 추출한다. 실패 시 빈 문자열 반환."""
     try:
-        return _extract_hwpx(file_bytes)
+        return _PRIVATE_USE.sub("", _extract_hwpx(file_bytes))
     except (zipfile.BadZipFile, KeyError):
         pass
 
     try:
-        return _extract_hwp(file_bytes)
+        return _PRIVATE_USE.sub("", _extract_hwp(file_bytes))
     except Exception:
         return ""
 
