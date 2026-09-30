@@ -4,6 +4,7 @@
 지금 할 단계가 화면 중심에 오게 한다. 기업은 사이드바의 현재 기업을 쓴다 (app.py 참고).
 """
 
+import pandas as pd
 import streamlit as st
 
 import announcement_ui as ui
@@ -35,12 +36,21 @@ def _section_key(name: str) -> str:
     return f"aw_section_{name}"
 
 
+def _ordered_names() -> list[str]:
+    """초안 항목 이름을 양식 순서대로. 저장된 초안은 DB(jsonb)가 키를 길이순으로 다시 정렬해 돌려주므로
+    저장된 순서를 믿지 않고 요건 분석의 항목 순서를 따른다 (거기 없는 항목은 뒤에)."""
+    drafts = st.session_state.get("aw_draft_sections") or {}
+    form_order = [
+        s.get("section_name") for s in (st.session_state.get("aw_requirements") or {}).get("form_sections") or []
+    ]
+    return [n for n in form_order if n in drafts] + [n for n in drafts if n not in form_order]
+
+
 def _current_sections() -> dict:
-    """섹션 텍스트의 현재 값(사람이 직접 수정한 내용 포함)을 위젯 상태에서 모아온다."""
-    return {
-        name: st.session_state.get(_section_key(name), text)
-        for name, text in (st.session_state.get("aw_draft_sections") or {}).items()
-    }
+    """섹션 텍스트의 현재 값(사람이 직접 수정한 내용 포함)을 양식 순서대로 모은다. 입력칸이 아직 그려지지
+    않은 실행에서는 위젯 값이 비어 보일 수 있어, 그때는 마지막으로 그려질 때 보관해 둔 사본을 쓴다."""
+    drafts = st.session_state.get("aw_draft_sections") or {}
+    return {name: st.session_state.get(_section_key(name)) or drafts.get(name) or "" for name in _ordered_names()}
 
 
 def _reset_downstream_state():
@@ -335,6 +345,114 @@ def _badge_text(text: str) -> str:
     return text.replace("[", "(").replace("]", ")")
 
 
+EDITOR_COLUMNS = ["_key", "순서", "장", "항목명", "종류", "분량 제한", "칸·열", "작성 조언"]
+
+
+def _sections_frame(sections: list[dict]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "_key": i,
+                "순서": i + 1,
+                "장": s.get("chapter") or "",
+                "항목명": s.get("section_name") or "",
+                "종류": s.get("type") or "서술",
+                "분량 제한": s.get("length_limit") or "",
+                "칸·열": ", ".join(s.get("fields") or s.get("table_columns") or []),
+                "작성 조언": s.get("guidance") or "",
+            }
+            for i, s in enumerate(sections)
+        ],
+        columns=EDITOR_COLUMNS,
+    )
+
+
+def _text(value) -> str:
+    return "" if value is None or (isinstance(value, float) and pd.isna(value)) else str(value).strip()
+
+
+def _apply_section_edits(edited: pd.DataFrame):
+    """편집기에서 고친 작성 항목을 요건 분석 결과에 반영한다. 원래 항목은 양식 작성요령·배점·인쇄된 값
+    등 편집기에 보이지 않는 정보를 그대로 두고, 이미 쓴 초안은 바뀐 이름으로 옮긴다 (삭제한 항목의 초안은 버림)."""
+    old = st.session_state.aw_requirements.get("form_sections") or []
+    rows = edited.to_dict("records")
+    rows.sort(key=lambda r: (float(r["순서"]) if _text(r.get("순서")) else float("inf")))
+
+    new_sections, old_name_of, seen = [], {}, set()
+    for r in rows:
+        name = _text(r.get("항목명"))
+        if not name:
+            continue
+        key = r.get("_key")
+        is_existing = _text(key) != "" and 0 <= int(float(key)) < len(old)
+        base = dict(old[int(float(key))]) if is_existing else {
+            "section_id": "", "form_guidance": "", "evaluation": "", "fields": [], "table_columns": [],
+            "table_rows": [], "preset_values": {}, "source": "직접 추가",
+        }
+        unique, n = name, 2
+        while unique in seen:
+            unique, n = f"{name} ({n})", n + 1
+        seen.add(unique)
+        if is_existing:
+            old_name_of[unique] = base["section_name"]
+        section_type = _text(r.get("종류"))
+        section_type = section_type if section_type in application_writer.SECTION_TYPES else "서술"
+        columns = [c.strip() for c in _text(r.get("칸·열")).split(",") if c.strip()]
+        base.update(
+            section_name=unique,
+            chapter=_text(r.get("장")),
+            type=section_type,
+            length_limit=_text(r.get("분량 제한")),
+            guidance=_text(r.get("작성 조언")),
+            fields=columns if section_type == "기재란" else [],
+            table_columns=[] if section_type == "기재란" else columns,
+        )
+        new_sections.append(base)
+
+    st.session_state.aw_requirements = {**st.session_state.aw_requirements, "form_sections": new_sections}
+
+    if st.session_state.aw_draft_sections:
+        drafts = {}
+        for s in new_sections:
+            source_name = old_name_of.get(s["section_name"])
+            text = (
+                st.session_state.get(_section_key(source_name), st.session_state.aw_draft_sections.get(source_name, ""))
+                if source_name else ""
+            )
+            drafts[s["section_name"]] = text
+            st.session_state[_section_key(s["section_name"])] = text
+        st.session_state.aw_draft_sections = drafts
+
+    st.session_state.aw_edit_sections = False
+    st.session_state.aw_editor_version = st.session_state.get("aw_editor_version", 0) + 1
+
+
+def render_section_editor(sections: list[dict]):
+    st.caption(
+        "행을 고치거나, 맨 아래 빈 행에 새 항목을 추가하거나, 행을 골라 삭제하세요. 순서 숫자로 순서를 바꿉니다. "
+        "칸·열에는 기재란의 칸 이름 또는 표의 열 제목을 쉼표로 적습니다. 양식 작성요령·배점 같은 원래 정보는 그대로 유지됩니다."
+    )
+    edited = st.data_editor(
+        _sections_frame(sections),
+        key=f"aw_sections_editor_{st.session_state.get('aw_editor_version', 0)}",
+        num_rows="dynamic",
+        hide_index=True,
+        column_order=[c for c in EDITOR_COLUMNS if c != "_key"],
+        column_config={
+            "순서": st.column_config.NumberColumn(width="small", min_value=1, step=1),
+            "장": st.column_config.TextColumn(width="medium"),
+            "항목명": st.column_config.TextColumn(width="large", required=True),
+            "종류": st.column_config.SelectboxColumn(options=list(application_writer.SECTION_TYPES), width="small", default="서술"),
+            "분량 제한": st.column_config.TextColumn(width="small"),
+            "칸·열": st.column_config.TextColumn(width="medium"),
+            "작성 조언": st.column_config.TextColumn(width="large"),
+        },
+    )
+    if st.session_state.aw_draft_sections:
+        st.caption(":material/info: 이미 쓴 초안은 바뀐 항목 이름을 따라가고, 삭제한 항목의 초안은 지워집니다. 새로 추가한 항목은 초안 화면에서 AI로 채울 수 있습니다.")
+    st.button("편집 내용 적용", type="primary", icon=":material/check:", on_click=_apply_section_edits, args=(edited,))
+
+
 def render_requirements(req: dict):
     """요건 분석 결과: 작성 항목(양식 구조 그대로), 평가 기준, 제출 서류."""
     sections = req.get("form_sections") or []
@@ -361,14 +479,21 @@ def render_requirements(req: dict):
         [f"작성 항목 {len(sections)}", f"평가 기준 {len(criteria)}", f"제출 서류 {len(documents)}"]
     )
     with tab_sections:
+        editing = st.toggle(
+            "항목 편집", key="aw_edit_sections", help="AI가 뽑은 작성 항목을 직접 추가·삭제·수정합니다."
+        )
+        if editing:
+            render_section_editor(sections)
         chapter = None
-        for s in sections:
+        for s in [] if editing else sections:
             if s.get("chapter") and s["chapter"] != chapter:
                 chapter = s["chapter"]
                 st.markdown(f"**{chapter}**")
             badges = [TYPE_BADGES.get(s.get("type"), "")]
             if s.get("source") == "추정":
                 badges.append(":orange-badge[AI 추정]")
+            elif s.get("source") == "직접 추가":
+                badges.append(":blue-badge[직접 추가]")
             if s.get("length_limit"):
                 badges.append(f":gray-badge[:material/straighten: {_badge_text(s['length_limit'])}]")
             if s.get("evaluation"):
@@ -455,26 +580,64 @@ else:
 # ---------------------------------------------------------------- 4. 검토·수정
 
 st.subheader("4. 초안 검토·수정", anchor=False)
+
+# 항목 편집으로 새로 추가했거나 비워 둔 항목은 나머지 초안을 그대로 둔 채 그 항목만 AI로 채운다.
+# 버튼은 요청만 남기고, 실제 작성은 입력칸이 그려지기 전인 여기서 해서 결과를 입력칸에 바로 넣는다.
+if st.session_state.pop("aw_fill_empty_requested", False):
+    empty_before = [n for n, t in st.session_state.aw_draft_sections.items() if not (t or "").strip()]
+    if empty_before:
+        with st.spinner(f"AI가 {len(empty_before)}개 항목을 작성하는 중..."):
+            try:
+                filled = application_writer.draft_application_sections(
+                    st.session_state.aw_company_profile, st.session_state.aw_extra_context, requirements,
+                    only=set(empty_before), existing=dict(st.session_state.aw_draft_sections),
+                )
+            except Exception as e:
+                st.error(f"작성하지 못했습니다: {e}")
+                filled = {}
+        for name, text in filled.items():
+            st.session_state.aw_draft_sections[name] = text
+            st.session_state[_section_key(name)] = text
+
+# 비어 있는 항목 안내는 입력칸을 다 그린 뒤(최신 값 기준)에 이 자리에 채운다
+empty_notice = st.container()
+
 c_draft, c_chat = st.columns([3, 2])
 
 with c_draft:
     st.caption("각 항목을 직접 고치거나, 오른쪽에서 AI에게 수정을 요청하세요. 표는 마크다운 표로 쓰여 있고 아래에서 미리 볼 수 있습니다.")
     meta = {s["section_name"]: s for s in requirements.get("form_sections") or [] if s.get("section_name")}
     chapter = None
-    for name in st.session_state.aw_draft_sections:
+    for name in _ordered_names():
         s = meta.get(name, {})
         if s.get("chapter") and s["chapter"] != chapter:
             chapter = s["chapter"]
             st.markdown(f"##### {chapter}")
-        text = st.session_state.get(_section_key(name), "")
+        header = st.empty()
+        if _section_key(name) not in st.session_state:
+            st.session_state[_section_key(name)] = st.session_state.aw_draft_sections.get(name) or ""
+        # 입력칸 값(직접 고친 내용 포함)을 위젯과 별도로 보관한다. 입력칸이 그려지기 전에는 서버에서
+        # 위젯 값을 읽을 수 없는 실행이 있어, 비어 있는지·글자 수 등은 이 사본으로 판단한다.
+        text = st.text_area(
+            name, key=_section_key(name), height={"기재란": 160, "표": 200}.get(s.get("type"), 240),
+            label_visibility="collapsed",
+        )
+        st.session_state.aw_draft_sections[name] = text
         badges = [TYPE_BADGES.get(s.get("type"), "")] if s.get("type") else []
         info = f":gray[{len(text):,}자" + (f" · 양식 제한 {s['length_limit']}" if s.get("length_limit") else "") + "]"
-        st.markdown(f"**{name}** " + " ".join([b for b in badges if b] + [info]))
-        height = {"기재란": 160, "표": 200}.get(s.get("type"), 240)
-        st.text_area(name, key=_section_key(name), height=height, label_visibility="collapsed")
+        header.markdown(f"**{name}** " + " ".join([b for b in badges if b] + [info]))
         if any(kind == "table" for kind, _ in application_writer.split_blocks(text)):
             with st.expander("표 미리보기", icon=":material/table:"):
                 st.markdown(text)
+
+empty_sections = [n for n, t in st.session_state.aw_draft_sections.items() if not (t or "").strip()]
+if empty_sections:
+    with empty_notice, st.container(horizontal=True, vertical_alignment="center"):
+        st.caption(f":orange[:material/edit_off: 비어 있는 항목 {len(empty_sections)}개: {', '.join(empty_sections)}]")
+        st.button(
+            "빈 항목 AI로 작성", icon=":material/auto_awesome:",
+            on_click=lambda: st.session_state.update(aw_fill_empty_requested=True),
+        )
 
 with c_chat:
     with st.container(border=True):

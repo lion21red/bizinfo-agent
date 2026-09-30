@@ -478,16 +478,21 @@ def _draft_summary(section: dict, body: dict) -> str:
     return str(_parse_json_response(response).get("text") or "")
 
 
-def draft_application_sections(company_profile: dict, extra_context: str, requirements: dict) -> dict:
+def draft_application_sections(company_profile: dict, extra_context: str, requirements: dict,
+                               only: set[str] | None = None, existing: dict | None = None) -> dict:
     """양식 항목별 초안. 본문 항목은 몇 개씩 나눠 동시에 쓰고, 요약문은 본문을 다 쓴 뒤 그 내용을
     바탕으로 마지막에 쓴다 (본문보다 요약문을 먼저 쓰면 본문과 어긋나기 쉽다).
-    반환 순서는 양식 순서와 같다."""
+
+    only를 주면 그 이름의 항목만 쓴다 (예: 직접 추가해서 비어 있는 항목). 이때 요약문은 existing(이미
+    쓴 초안)과 새로 쓴 본문을 함께 바탕으로 쓴다. 반환 순서는 양식 순서와 같다.
+    """
     sections = requirements.get("form_sections") or []
     if not sections:
         return {}
     outline = [s["section_name"] for s in sections]
-    body_sections = [s for s in sections if not is_summary(s)]
-    summary_sections = [s for s in sections if is_summary(s)]
+    targets = [s for s in sections if only is None or s["section_name"] in only]
+    body_sections = [s for s in targets if not is_summary(s)]
+    summary_sections = [s for s in targets if is_summary(s)]
 
     batches = [body_sections[i:i + DRAFT_BATCH_SIZE] for i in range(0, len(body_sections), DRAFT_BATCH_SIZE)]
     drafted = {}
@@ -497,12 +502,16 @@ def draft_application_sections(company_profile: dict, extra_context: str, requir
         ):
             drafted.update(result)
 
-    body = {name: drafted[name] for name in outline if name in drafted}
+    written = {**(existing or {}), **drafted}
+    body = {
+        s["section_name"]: written[s["section_name"]]
+        for s in sections if not is_summary(s) and written.get(s["section_name"])
+    }
     for s in summary_sections:
         drafted[s["section_name"]] = _draft_summary(s, body)
 
     # AI가 일부 항목을 빠뜨려도 화면에 빈 칸으로라도 항상 표시되도록, 양식 순서대로 채운다
-    return {name: drafted.get(name, "") for name in outline}
+    return {name: drafted.get(name, "") for name in outline if only is None or name in only}
 
 
 def refine_draft_via_chat(
