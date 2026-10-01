@@ -96,10 +96,11 @@ def render_import():
     with tab_site:
         st.caption(
             "기업 홈페이지 주소를 넣으면 AI가 회사소개·연혁·제품 등 주요 페이지를 읽고, 하단 사업자 정보로 "
-            "어느 기업의 홈페이지인지 확인한 뒤 정보를 정리합니다."
+            "어느 기업의 홈페이지인지 확인한 뒤 정보를 정리합니다. 홈페이지가 없는 업체는 네이버 지도(플레이스) "
+            "주소를 넣어도 됩니다."
         )
         with st.container(horizontal=True, vertical_alignment="bottom"):
-            site_url = st.text_input("홈페이지 주소", key="site_url", placeholder="www.example.co.kr")
+            site_url = st.text_input("홈페이지 주소", key="site_url", placeholder="www.example.co.kr 또는 네이버 지도 주소")
             fetch_site = st.button("가져오기", icon=":material/download:", disabled=not site_url.strip(), key="fetch_site")
         if fetch_site:
             with st.spinner("홈페이지를 읽고 기업을 확인하는 중..."):

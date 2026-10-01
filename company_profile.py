@@ -144,7 +144,9 @@ HOMEPAGE_PROMPT_TEMPLATE = """
 가져온 페이지들의 텍스트입니다.
 
 1. 먼저 이 홈페이지의 주인이 어떤 기업인지 확인하세요. 한국 기업 홈페이지 하단에 보통 있는 상호·대표자·
-   사업자등록번호·주소 표시를 가장 신뢰할 수 있는 근거로 쓰세요.
+   사업자등록번호·주소 표시를 가장 신뢰할 수 있는 근거로 쓰세요. 네이버 플레이스 등록 정보가 있으면 그 상호·
+   주소·업종을 근거로 쓰되, 사업자등록번호·대표자처럼 거기 없는 정보는 지어내지 마세요. 음식점·소매점처럼
+   플레이스의 메뉴·취급 품목이 있으면 detail_notes의 주요 제품·서비스에 정리하세요.
 2. 그 기업의 정보를 지정된 JSON 형식으로 정리하세요. 홈페이지에 없는 항목은 추측하지 말고 null 또는 0으로
    두세요. 특히 대표자 개인정보(생년 등)는 홈페이지에 직접 나온 경우가 아니면 비워 두세요.
    설립일은 연혁·회사소개의 설립(창립·법인 설립) 시점을 쓰고, 연월만 있으면 그달 1일로 적으세요
@@ -256,6 +258,82 @@ def fetch_site_pages(url: str) -> list[dict]:
     return [p for p in pages if p["text"]]
 
 
+# 네이버 지도·플레이스 주소 (예: map.naver.com/p/entry/place/123, m.place.naver.com/restaurant/123/home)
+_NAVER_PLACE_ID = re.compile(r"(?:place|restaurant|hospital|hairshop|accommodation|attraction|nailshop)/(\d+)")
+
+
+def _naver_place_id(url: str) -> str | None:
+    host = urlparse(url).netloc.lower()
+    if host == "naver.me":
+        # 공유용 짧은 주소는 지도 주소로 넘어간다
+        try:
+            url = requests.get(url, headers=_SITE_HEADERS, timeout=10, allow_redirects=True).url
+        except Exception:
+            return None
+        host = urlparse(url).netloc.lower()
+    if not host.endswith("naver.com") or "map" not in host and "place" not in host:
+        return None
+    match = _NAVER_PLACE_ID.search(url)
+    return match.group(1) if match else None
+
+
+def naver_place_page(place_id: str) -> dict:
+    """네이버 플레이스에 등록된 업체 정보를 읽어 한 페이지 분량의 글로 만든다.
+    플레이스 화면은 스크립트로 그려지지만, 페이지 안에 업체 정보(__APOLLO_STATE__)가 함께 들어 있다.
+    반환: {"url", "title", "text", "homepages": [...]}"""
+    page_url = f"https://pcmap.place.naver.com/place/{place_id}/home"
+    resp = requests.get(page_url, headers={**_SITE_HEADERS, "Referer": "https://map.naver.com/"}, timeout=15)
+    resp.raise_for_status()
+    resp.encoding = "utf-8"
+    match = re.search(r"__APOLLO_STATE__\s*=\s*(\{.*?\});\s*(?:</script>|window\.)", resp.text, re.S)
+    if not match:
+        raise ValueError("네이버 플레이스에서 업체 정보를 찾지 못했습니다.")
+    state = json.loads(match.group(1))
+    base = state.get(f"PlaceDetailBase:{place_id}") or {}
+    if not base.get("name"):
+        raise ValueError("네이버 플레이스에서 업체 정보를 찾지 못했습니다.")
+
+    homepages = []
+
+    def _collect_urls(value):
+        if isinstance(value, dict):
+            for v in value.values():
+                _collect_urls(v)
+        elif isinstance(value, list):
+            for v in value:
+                _collect_urls(v)
+        elif isinstance(value, str) and value.startswith("http") and "naver" not in value:
+            homepages.append(value)
+
+    _collect_urls(base.get("homepages"))
+    def _price(value) -> str:
+        # 가격은 {"displayText": "10,000원"} 형태이거나 숫자·문자열이다
+        text = value.get("displayText") if isinstance(value, dict) else value
+        text = str(text or "").strip()
+        return f" ({text}{'' if text.endswith('원') or not text[-1:].isdigit() else '원'})" if text else ""
+
+    menus = [
+        f"{v.get('name')}{_price(v.get('price'))}" + (f" - {v['description']}" if v.get("description") else "")
+        for k, v in state.items() if k.startswith("PlaceMenuItem:") and isinstance(v, dict) and v.get("name")
+    ]
+    lines = [
+        f"상호: {base.get('name')}",
+        f"업종(네이버 분류): {base.get('category') or ''}",
+        f"도로명 주소: {base.get('roadAddress') or ''}",
+        f"지번 주소: {base.get('address') or ''}",
+        f"전화: {base.get('phone') or base.get('virtualPhone') or ''}",
+        f"소개: {base.get('description') or ''}",
+        f"한줄 소개: {', '.join(base.get('microReviews') or [])}",
+        f"편의시설·서비스: {', '.join(base.get('conveniences') or [])}",
+        f"방문자 리뷰 {base.get('visitorReviewsTotal') or 0}건 (평점 {base.get('visitorReviewsScore') or '-'}), "
+        f"블로그·카페 리뷰 {base.get('cafeBlogReviewsTotal') or 0}건",
+        f"홈페이지: {', '.join(homepages)}",
+        "메뉴·취급 품목: " + "; ".join(menus[:30]),
+    ]
+    text = "\n".join(line for line in lines if not line.endswith(": ") and line.split(": ", 1)[-1].strip())
+    return {"url": page_url, "title": f"네이버 플레이스 - {base.get('name')}", "text": text, "homepages": homepages}
+
+
 def _parse_json_text(text: str) -> dict:
     match = re.search(r"\{.*\}", text or "", re.DOTALL)
     try:
@@ -263,6 +341,17 @@ def _parse_json_text(text: str) -> dict:
     except json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _profile_from_pages(url: str, pages: list[dict], how: str) -> tuple[dict, list[dict], str]:
+    pages_text = "\n\n".join(f"### {p['title'] or p['url']} ({p['url']})\n{p['text']}" for p in pages)
+    response = ai_client.models.generate_content(
+        model="gemini-flash-latest",
+        contents=HOMEPAGE_PROMPT_TEMPLATE.format(url=url, pages=pages_text, schema=_profile_json_schema()),
+        config={"response_mime_type": "application/json"},
+    )
+    sources = [{"title": p["title"] or p["url"], "uri": p["url"]} for p in pages]
+    return _parse_json_text(response.text), sources, how
 
 
 def homepage_profile(url: str) -> tuple[dict, list[dict], str]:
@@ -273,21 +362,29 @@ def homepage_profile(url: str) -> tuple[dict, list[dict], str]:
     반환: (프로필 + site_owner/confidence, 참고한 페이지 [{"title", "uri"}], 읽은 방식 설명)
     """
     url = normalize_url(url)
+
+    # 네이버 지도·플레이스 주소면 플레이스 등록 정보를 읽고, 등록된 홈페이지가 있으면 그것도 함께 읽는다
+    place_id = _naver_place_id(url)
+    if place_id:
+        place = naver_place_page(place_id)
+        pages, how = [place], "네이버 플레이스 등록 정보를 읽었습니다."
+        if place["homepages"]:
+            try:
+                site_pages = fetch_site_pages(normalize_url(place["homepages"][0]))[: SITE_PAGE_LIMIT - 1]
+            except Exception:
+                site_pages = []
+            if site_pages:
+                pages += site_pages
+                how = f"네이버 플레이스 등록 정보와 등록된 홈페이지 {len(site_pages)}개 페이지를 읽었습니다."
+        return _profile_from_pages(url, pages, how)
+
     try:
         pages = fetch_site_pages(url)
     except Exception:
         pages = []
 
     if sum(len(p["text"]) for p in pages) >= 400:
-        pages_text = "\n\n".join(f"### {p['title'] or p['url']} ({p['url']})\n{p['text']}" for p in pages)
-        response = ai_client.models.generate_content(
-            model="gemini-flash-latest",
-            contents=HOMEPAGE_PROMPT_TEMPLATE.format(url=url, pages=pages_text, schema=_profile_json_schema()),
-            config={"response_mime_type": "application/json"},
-        )
-        profile = _parse_json_text(response.text)
-        sources = [{"title": p["title"] or p["url"], "uri": p["url"]} for p in pages]
-        return profile, sources, f"홈페이지 {len(pages)}개 페이지를 직접 읽었습니다."
+        return _profile_from_pages(url, pages, f"홈페이지 {len(pages)}개 페이지를 직접 읽었습니다.")
 
     # 직접 읽은 내용이 거의 없으면 Gemini의 주소 읽기 도구로 다시 시도한다
     response = ai_client.models.generate_content(
