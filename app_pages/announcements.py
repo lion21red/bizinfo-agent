@@ -1,7 +1,7 @@
 """공고 DB 화면: 수집·분석된 공고 전체를 검색하고 훑어본다 (열 때마다 Supabase를 직접 조회)."""
 
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import streamlit as st
 
@@ -14,12 +14,35 @@ PAGE_SIZE = 30
 ACTIVE, ARCHIVE = "진행 중 공고", "마감된 공고"
 SORT_OPTIONS = ["최신순", "마감 임박순"]
 
-st.title("공고 DB")
-st.caption("기업마당에서 매일 수집하고 AI로 분석하는 정부 지원사업 공고입니다.")
+KST = timezone(timedelta(hours=9))
 
 
 def _count(query) -> int:
     return query.limit(1).execute().count or 0
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def last_update() -> datetime | None:
+    """마지막으로 공고를 수집한 시각. 수집기(collector.py)는 새 공고에 created_at을, 목록에서 사라진
+    공고에 closed_detected_at을 남기므로 둘 중 늦은 값을 쓴다 (기존 공고를 갱신할 때는 updated_at이
+    바뀌지 않아 기준으로 쓸 수 없다)."""
+    stamps = []
+    for column in ("created_at", "closed_detected_at"):
+        rows = (
+            matcher.supabase.table("announcements").select(column)
+            .not_.is_(column, "null").order(column, desc=True).limit(1).execute().data
+        )
+        if rows:
+            stamps.append(datetime.fromisoformat(rows[0][column]))
+    return max(stamps).astimezone(KST) if stamps else None
+
+
+st.title("공고 DB")
+updated = last_update()
+st.caption(
+    "기업마당에서 매일 수집하고 AI로 분석하는 정부 지원사업 공고입니다."
+    + (f"  \n:material/update: **최종 업데이트 {updated:%Y-%m-%d %H:%M}** (매일 17시 자동 수집)" if updated else "")
+)
 
 
 @st.cache_data(ttl=600, show_spinner=False)
