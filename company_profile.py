@@ -1,4 +1,4 @@
-"""기업 정보를 가져오고(서류·웹 검색·붙여넣기) 저장·불러오는 로직.
+"""기업 정보를 가져오고(서류·웹 검색·홈페이지·붙여넣기) 저장·불러오는 로직.
 
 화면(app_pages/matching.py)과 사이드바의 기업 선택기(app.py)가 함께 쓰므로 화면 코드와 분리해 둔다.
 """
@@ -6,8 +6,12 @@
 import json
 import os
 import re
+from urllib.parse import urljoin, urlparse
 
+import requests
 import streamlit as st
+import urllib3
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -17,6 +21,8 @@ import matcher
 import needs
 
 load_dotenv(override=True)
+# 인증서가 잘못된 홈페이지를 읽기 전용으로 다시 시도할 때 나오는 경고는 숨긴다 (_get 참고)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ai_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -131,6 +137,178 @@ def search_company_web_profile(company_name: str, region_hint: str = "") -> tupl
             sources.append({"title": chunk.web.title, "uri": chunk.web.uri})
 
     return profile, sources
+
+
+HOMEPAGE_PROMPT_TEMPLATE = """
+당신은 대한민국 정부 지원사업 신청 자격을 검토하는 경영지도사입니다. 아래는 어떤 기업의 홈페이지에서
+가져온 페이지들의 텍스트입니다.
+
+1. 먼저 이 홈페이지의 주인이 어떤 기업인지 확인하세요. 한국 기업 홈페이지 하단에 보통 있는 상호·대표자·
+   사업자등록번호·주소 표시를 가장 신뢰할 수 있는 근거로 쓰세요.
+2. 그 기업의 정보를 지정된 JSON 형식으로 정리하세요. 홈페이지에 없는 항목은 추측하지 말고 null 또는 0으로
+   두세요. 특히 대표자 개인정보(생년 등)는 홈페이지에 직접 나온 경우가 아니면 비워 두세요.
+   설립일은 연혁·회사소개의 설립(창립·법인 설립) 시점을 쓰고, 연월만 있으면 그달 1일로 적으세요
+   (예: "2014년 2월 설립" -> "2014-02-01").
+3. detail_notes에는 회사 개요, 주요 제품·서비스, 기술·강점, 연혁, 인증·특허, 주요 고객·실적을 홈페이지
+   내용에 근거해 구체적으로 정리하세요 (신청서 작성 참고자료로 쓰입니다).
+
+[홈페이지 주소]
+{url}
+
+[홈페이지 페이지들]
+{pages}
+
+[추출할 JSON 스키마 - 아래 항목에 두 가지를 더 넣으세요]
+- "site_owner": {{"company_name": "확인한 상호", "business_number": "사업자등록번호 (없으면 null)",
+  "evidence": "기업을 확인한 근거 (예: 하단 사업자 정보 '상호 ○○ | 대표 ○○ | 사업자등록번호 ○○')"}}
+- "confidence": "high | medium | low (기업 확인을 얼마나 확신하는지)"
+{schema}
+"""
+
+SITE_PAGE_LIMIT = 6
+SITE_PAGE_CHARS = 8000
+# 기업 정보가 있을 만한 하위 페이지 (링크 글자나 주소로 판단)
+_INFO_LINK = re.compile(
+    r"회사|기업|소개|인사말|연혁|비전|조직|사업|제품|솔루션|서비스|기술|인증|특허|수상|오시는|찾아오|위치|고객|실적|"
+    r"about|company|intro|greeting|history|vision|business|product|solution|service|technolog|certif|patent|"
+    r"award|location|contact|ceo",
+    re.I,
+)
+# 그중 기업 자체를 소개하는 페이지는 제품 페이지보다 먼저 읽는다 (페이지 수 제한이 있어서)
+_COMPANY_LINK = re.compile(r"회사|기업\s*소개|소개|인사말|연혁|오시는|찾아오|about|company|intro|greeting|history|ceo|location", re.I)
+_SITE_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"}
+
+
+def normalize_url(url: str) -> str:
+    url = (url or "").strip()
+    return url if re.match(r"^https?://", url, re.I) else f"https://{url}"
+
+
+def _get(url: str):
+    try:
+        resp = requests.get(url, headers=_SITE_HEADERS, timeout=10)
+    except requests.exceptions.SSLError:
+        # 인증서 설정이 잘못된 중소기업 홈페이지가 흔해 읽기 전용으로만 한 번 더 시도한다
+        resp = requests.get(url, headers=_SITE_HEADERS, timeout=10, verify=False)
+    resp.raise_for_status()
+    if not resp.encoding or resp.encoding.lower() == "iso-8859-1":
+        resp.encoding = resp.apparent_encoding  # euc-kr 등 인코딩을 밝히지 않은 한국어 페이지
+    return resp
+
+
+def _page_text(soup) -> str:
+    for tag in soup(["script", "style", "noscript", "svg"]):
+        tag.decompose()
+    lines = [line.strip() for line in soup.get_text("\n").splitlines()]
+    return "\n".join(line for line in lines if line)[:SITE_PAGE_CHARS]
+
+
+def _same_site(a: str, b: str) -> bool:
+    host = lambda u: urlparse(u).netloc.lower().removeprefix("www.")  # noqa: E731
+    return host(a) == host(b)
+
+
+def fetch_site_pages(url: str) -> list[dict]:
+    """홈페이지 첫 화면과, 기업 정보가 있을 만한 같은 사이트의 하위 페이지를 몇 개 읽는다.
+    반환: [{"url", "title", "text"}] (읽지 못한 페이지는 빠짐)"""
+    try:
+        home = _get(url)
+    except requests.exceptions.ConnectionError:
+        if not url.startswith("https://"):
+            raise
+        home = _get("http://" + url[len("https://"):])  # https를 지원하지 않는 옛 홈페이지
+    soup = BeautifulSoup(home.text, "lxml")
+    pages = [{"url": home.url, "title": (soup.title.string or "").strip() if soup.title else "", "text": None}]
+
+    # (우선순위, 순서, 주소): 프레임으로 만든 옛 홈페이지는 실제 내용이 frame/iframe 안에 있어 가장 먼저,
+    # 그다음 회사 소개 페이지, 그다음 제품·사업 페이지 순으로 읽는다
+    candidates = []
+    for frame in soup.find_all(["frame", "iframe"], src=True):
+        src = urljoin(home.url, frame["src"]).split("#")[0]
+        if src.startswith("http") and _same_site(src, home.url):
+            candidates.append((0, len(candidates), src))
+    for a in soup.find_all("a", href=True):
+        href = urljoin(home.url, a["href"]).split("#")[0]
+        label = f"{a.get_text(' ', strip=True)} {urlparse(href).path}"
+        if href.startswith("http") and _same_site(href, home.url) and _INFO_LINK.search(label):
+            candidates.append((1 if _COMPANY_LINK.search(label) else 2, len(candidates), href))
+    candidates.sort()
+    pages[0]["text"] = _page_text(soup)
+
+    seen = {home.url.rstrip("/")}
+    for _, _, link in candidates:
+        if len(pages) >= SITE_PAGE_LIMIT:
+            break
+        if link.rstrip("/") in seen or re.search(r"\.(pdf|jpe?g|png|gif|zip|hwp|docx?)$", link, re.I):
+            continue
+        seen.add(link.rstrip("/"))
+        try:
+            resp = _get(link)
+        except Exception:
+            continue
+        if resp.url.rstrip("/") in seen and resp.url.rstrip("/") != link.rstrip("/"):
+            continue  # 다른 주소가 같은 페이지로 넘어가는 경우
+        seen.add(resp.url.rstrip("/"))
+        sub = BeautifulSoup(resp.text, "lxml")
+        text = _page_text(sub)
+        if text:
+            pages.append({"url": resp.url, "title": (sub.title.string or "").strip() if sub.title else "", "text": text})
+    return [p for p in pages if p["text"]]
+
+
+def _parse_json_text(text: str) -> dict:
+    match = re.search(r"\{.*\}", text or "", re.DOTALL)
+    try:
+        parsed = json.loads(match.group(0)) if match else {}
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def homepage_profile(url: str) -> tuple[dict, list[dict], str]:
+    """홈페이지 주소로 기업을 확인하고 정보를 정리한다.
+
+    홈페이지를 직접 읽어 하위 페이지까지 모으고, 내용이 거의 없으면(스크립트로 그리는 사이트 등)
+    Gemini가 주소를 직접 읽게 한다.
+    반환: (프로필 + site_owner/confidence, 참고한 페이지 [{"title", "uri"}], 읽은 방식 설명)
+    """
+    url = normalize_url(url)
+    try:
+        pages = fetch_site_pages(url)
+    except Exception:
+        pages = []
+
+    if sum(len(p["text"]) for p in pages) >= 400:
+        pages_text = "\n\n".join(f"### {p['title'] or p['url']} ({p['url']})\n{p['text']}" for p in pages)
+        response = ai_client.models.generate_content(
+            model="gemini-flash-latest",
+            contents=HOMEPAGE_PROMPT_TEMPLATE.format(url=url, pages=pages_text, schema=_profile_json_schema()),
+            config={"response_mime_type": "application/json"},
+        )
+        profile = _parse_json_text(response.text)
+        sources = [{"title": p["title"] or p["url"], "uri": p["url"]} for p in pages]
+        return profile, sources, f"홈페이지 {len(pages)}개 페이지를 직접 읽었습니다."
+
+    # 직접 읽은 내용이 거의 없으면 Gemini의 주소 읽기 도구로 다시 시도한다
+    response = ai_client.models.generate_content(
+        model="gemini-flash-latest",
+        contents=HOMEPAGE_PROMPT_TEMPLATE.format(
+            url=url, pages="(직접 읽지 못했습니다. 위 주소와 그 하위 페이지를 직접 열어 확인하세요.)",
+            schema=_profile_json_schema(),
+        ),
+        config=types.GenerateContentConfig(tools=[types.Tool(url_context=types.UrlContext())]),
+    )
+    candidates = response.candidates or []
+    meta = getattr(candidates[0], "url_context_metadata", None) if candidates else None
+    sources = [
+        {"title": m.retrieved_url, "uri": m.retrieved_url}
+        for m in (getattr(meta, "url_metadata", None) or [])
+        if "SUCCESS" in str(getattr(m, "url_retrieval_status", ""))
+    ]
+    # 페이지를 실제로 열지 못했는데 답을 받으면 지어낸 정보일 수 있어 쓰지 않는다
+    if not sources:
+        raise ValueError("홈페이지를 열 수 없습니다. 주소가 맞는지 확인해 주세요.")
+    return _parse_json_text(response.text), sources, "홈페이지를 직접 읽지 못해 AI가 주소를 열어 확인했습니다."
 
 
 def merge_profile(base: dict | None, updates: dict) -> dict:

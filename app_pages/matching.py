@@ -22,7 +22,7 @@ ORG_TYPES = ["일반기업", "사회적기업", "협동조합", "마을기업", 
 PAGE_SIZE = 20
 SORT_OPTIONS = ["적합도순", "마감 임박순"]
 
-for key, default in (("web_search_result", None), ("web_search_sources", None)):
+for key, default in (("web_search_result", None), ("web_search_sources", None), ("site_result", None)):
     if key not in st.session_state:
         st.session_state[key] = default
 
@@ -87,10 +87,61 @@ def _apply_import(found: dict):
 
 
 def render_import():
-    """웹 검색·서류 업로드·붙여넣기로 기업 정보를 가져와 현재 기업에 합친다 (비어 있는 항목만 덮지 않음)."""
-    tab_web, tab_upload, tab_paste = st.tabs(
-        [":material/travel_explore: 웹 검색", ":material/upload_file: 서류 업로드", ":material/content_paste: 텍스트 붙여넣기"]
-    )
+    """홈페이지·웹 검색·서류 업로드·붙여넣기로 기업 정보를 가져와 현재 기업에 합친다 (비어 있는 항목만 덮지 않음)."""
+    tab_site, tab_web, tab_upload, tab_paste = st.tabs([
+        ":material/language: 홈페이지 주소", ":material/travel_explore: 웹 검색",
+        ":material/upload_file: 서류 업로드", ":material/content_paste: 텍스트 붙여넣기",
+    ])
+
+    with tab_site:
+        st.caption(
+            "기업 홈페이지 주소를 넣으면 AI가 회사소개·연혁·제품 등 주요 페이지를 읽고, 하단 사업자 정보로 "
+            "어느 기업의 홈페이지인지 확인한 뒤 정보를 정리합니다."
+        )
+        with st.container(horizontal=True, vertical_alignment="bottom"):
+            site_url = st.text_input("홈페이지 주소", key="site_url", placeholder="www.example.co.kr")
+            fetch_site = st.button("가져오기", icon=":material/download:", disabled=not site_url.strip(), key="fetch_site")
+        if fetch_site:
+            with st.spinner("홈페이지를 읽고 기업을 확인하는 중..."):
+                try:
+                    found, sources, how = cp.homepage_profile(site_url)
+                    st.session_state.site_result = {"profile": found, "sources": sources, "how": how}
+                except Exception as e:
+                    st.session_state.site_result = None
+                    st.error(f"가져오지 못했습니다: {e}")
+        site = st.session_state.site_result
+        if site:
+            found = site["profile"]
+            owner = found.get("site_owner") or {}
+            with st.container(border=True):
+                confidence = {"high": ":green-badge[확인됨]", "medium": ":orange-badge[대체로 확인]", "low": ":red-badge[확인 불충분]"}
+                st.markdown(
+                    f"**{owner.get('company_name') or found.get('company_name') or '기업명 확인 안 됨'}** "
+                    + confidence.get(found.get("confidence"), "")
+                    + (f" :gray[사업자등록번호 {owner['business_number']}]" if owner.get("business_number") else "")
+                )
+                if owner.get("evidence"):
+                    st.caption(f":material/verified: {owner['evidence']}")
+                if found.get("confidence") == "low":
+                    st.warning("홈페이지에서 어느 기업인지 분명하게 확인하지 못했습니다. 내용을 확인한 뒤 적용하세요.",
+                               icon=":material/warning:")
+                render_field_grid([
+                    ("대표자", found.get("ceo_name") or "-"),
+                    ("업종", found.get("industry") or "-"),
+                    ("소재지", found.get("region") or "-"),
+                    ("설립일", found.get("establishment_date") or "-"),
+                    ("상시 근로자", f"{found['employee_count']}명" if found.get("employee_count") else "-"),
+                    ("보유 인증", found.get("certifications") or "-"),
+                ])
+                if found.get("detail_notes"):
+                    with st.expander("정리된 회사 개요", icon=":material/description:"):
+                        st.markdown(found["detail_notes"])
+                st.caption(site["how"] + " " + " · ".join(
+                    f"[{s.get('title') or s.get('uri')}]({s.get('uri')})" for s in site["sources"][:6]
+                ))
+                if st.button("이 정보 적용", type="primary", key="apply_site_result"):
+                    st.session_state.site_result = None
+                    _apply_import({k: v for k, v in found.items() if k not in ("site_owner", "confidence")})
 
     with tab_web:
         st.caption("공식 홈페이지를 우선 참고해 AI가 구글 검색으로 찾아 정리합니다 (광고성 결과 제외).")
